@@ -1,0 +1,6 @@
+{
+  "stdoutLines": [
+    "echo:hello"
+  ],
+  "stderrLines": []
+}

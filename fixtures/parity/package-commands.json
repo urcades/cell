@@ -1,0 +1,51 @@
+{
+  "installLocal": {
+    "exitCode": 0,
+    "stdoutLines": [
+      "Installing ./pkg...",
+      "Installed ./pkg"
+    ],
+    "stderrLines": []
+  },
+  "installNpm": {
+    "exitCode": 0,
+    "stdoutLines": [
+      "Installing npm:./npm-pkg...",
+      "Installed npm:./npm-pkg"
+    ],
+    "stderrLines": []
+  },
+  "list": {
+    "exitCode": 0,
+    "stdoutLines": [
+      "Project packages:",
+      "  ../pkg",
+      "    <CWD>/pkg"
+    ],
+    "stderrLines": []
+  },
+  "updateNpm": {
+    "exitCode": 0,
+    "stdoutLines": [
+      "Updating npm:./npm-pkg...",
+      "Updated npm:./npm-pkg"
+    ],
+    "stderrLines": []
+  },
+  "removeNpm": {
+    "exitCode": 0,
+    "stdoutLines": [
+      "Removing npm:./npm-pkg...",
+      "Removed npm:./npm-pkg"
+    ],
+    "stderrLines": []
+  },
+  "removeLocal": {
+    "exitCode": 0,
+    "stdoutLines": [
+      "Removing ./pkg...",
+      "Removed ./pkg"
+    ],
+    "stderrLines": []
+  }
+}

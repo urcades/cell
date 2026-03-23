@@ -1,0 +1,19 @@
+{
+  "commands": [
+    {
+      "name": "review",
+      "description": "Review a target (project)",
+      "source": "prompt",
+      "location": "project",
+      "path": "<CWD>/.pi/prompts/review.md"
+    },
+    {
+      "name": "skill:checks",
+      "description": "Run verification checks",
+      "source": "skill",
+      "location": "project",
+      "path": "<CWD>/.pi/skills/checks/SKILL.md"
+    }
+  ],
+  "systemPrompt": "global system\n\nproject append\n\n# Project Context\n\nProject-specific instructions and guidelines:\n\n## <TMP>/AGENTS.md\n\nroot instructions\n\n## <CWD>/AGENTS.md\n\ncwd instructions\n\n\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>checks</name>\n    <description>Run verification checks</description>\n    <location><CWD>/.pi/skills/checks/SKILL.md</location>\n  </skill>\n</available_skills>\nCurrent date and time: <NOW>\nCurrent working directory: <CWD>"
+}

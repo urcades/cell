@@ -1,0 +1,2 @@
+Unknown option --bogus for "install".
+Use "pi-rust --help" or "pi-rust install <source> [-l]".

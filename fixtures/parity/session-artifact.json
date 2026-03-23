@@ -1,0 +1,28 @@
+{
+  "entries": [
+    {
+      "type": "session",
+      "cwd": "<CWD>"
+    },
+    {
+      "type": "model_change",
+      "provider": "openai",
+      "modelId": "gpt-5.1-codex"
+    },
+    {
+      "type": "thinking_level_change",
+      "thinkingLevel": "off"
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "text": "hello"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "stopReason": "stop",
+      "text": "echo:hello"
+    }
+  ]
+}

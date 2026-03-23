@@ -1,0 +1,17 @@
+{
+  "lines": [
+    {
+      "id": "1",
+      "type": "response",
+      "command": "bash",
+      "success": true,
+      "data": {
+        "output": "hello",
+        "exitCode": 0,
+        "cancelled": false,
+        "truncated": false
+      }
+    }
+  ],
+  "stderrLines": []
+}

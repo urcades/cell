@@ -1,0 +1,29 @@
+[package]
+name = "pi-rust-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pi-rust-ai-core = { path = "../pi-rust-ai-core" }
+pi-rust-ai-providers = { path = "../pi-rust-ai-providers" }
+pi-rust-config = { path = "../pi-rust-config" }
+pi-rust-models = { path = "../pi-rust-models" }
+pi-rust-oauth = { path = "../pi-rust-oauth" }
+pi-rust-packages = { path = "../pi-rust-packages" }
+pi-rust-protocol = { path = "../pi-rust-protocol" }
+pi-rust-resources = { path = "../pi-rust-resources" }
+pi-rust-session = { path = "../pi-rust-session" }
+pi-rust-tools = { path = "../pi-rust-tools" }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

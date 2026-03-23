@@ -1,0 +1,10 @@
+{
+  "exitCode": 0,
+  "stdoutLines": [
+    "Exported to: <TMP>/export.html"
+  ],
+  "stderrLines": [],
+  "htmlChecks": {
+    "containsAssistant": true
+  }
+}

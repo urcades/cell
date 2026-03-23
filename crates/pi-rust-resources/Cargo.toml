@@ -1,0 +1,17 @@
+[package]
+name = "pi-rust-resources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pi-rust-config = { path = "../pi-rust-config" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
