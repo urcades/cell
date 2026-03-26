@@ -1,30 +1,40 @@
 # Plugin Capability Matrix
 
-This document tracks the live-versus-deferred split for the Rust plugin host.
+This document describes the product-level boundary between the Rust-native plugin system and the older extension model it replaced.
 
-## Live capability classes
+## Live in the current Rust product
 
-- Descriptor discovery from `pi-plugin-host.json` and `plugin-host.json`
-- Handshake and manifest registration over stdio
-- Command dispatch
-- Tool dispatch
-- Lifecycle hook dispatch
-- Startup diagnostics and duplicate capability rejection
+- descriptor discovery from `cell-plugin-host.json` and `plugin-host.json`
+- out-of-process launch
+- stdio handshake and manifest registration
+- command dispatch
+- tool dispatch
+- lifecycle hook dispatch
+- startup diagnostics and duplicate capability rejection
+- plugin diagnostics through the main CLI and RPC surfaces
 
-## Deferred capability classes
+## Accepted but deferred
 
-- Plugin flags as a live CLI/runtime surface
-- Provider execution
-- Model execution
-- Per-package manifest and resource filtering semantics for plugin runtime behaviors
-- Custom UI surfaces
+These capability classes are part of the manifest and diagnostics story, but not part of the live runtime story yet:
 
-## Inherent mismatch
+- plugin flags as a live CLI/runtime surface
+- provider execution
+- model execution
 
-- Embedding the TypeScript extension runtime or executing JS/TS extensions directly
+## Compatibility holdovers
 
-## Notes
+These are still present, but they are not the product direction:
 
-- Provider and model registrations are already accepted and merged, but they are not dispatched yet.
-- Flags are already part of the manifest and startup summary, but they are not wired into a live plugin flag surface yet.
-- `pi-rust` stays pure Rust; parity means matching the practical capability class, not reproducing the TypeScript runtime literally.
+- project-scoped settings under `.pi/settings.json`
+- some `PI_*` environment variable names
+- optional TypeScript parity tooling through `PI_TS_REPO`
+
+## Explicit non-goals
+
+- executing JavaScript or TypeScript extensions directly
+- embedding Node or Bun into the Rust runtime
+- reproducing the old injected extension UI system
+
+## Practical rule
+
+When evaluating plugin work in this repo, judge it against the Rust-native capability classes above, not against the old JS extension runtime.

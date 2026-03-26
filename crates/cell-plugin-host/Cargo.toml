@@ -1,0 +1,19 @@
+[package]
+name = "cell-plugin-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cell-jsonline-transport = { path = "../cell-jsonline-transport" }
+cell-plugin-protocol = { path = "../cell-plugin-protocol" }
+cell-plugins = { path = "../cell-plugins" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

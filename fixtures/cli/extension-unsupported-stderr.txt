@@ -1,1 +1,1 @@
-pi-rust v1 does not execute JS/TS extensions. Remove --extension/--no-extensions and any extension-only package resources.
+cell v1 does not execute JS/TS extensions. Remove --extension/--no-extensions and any extension-only package resources.

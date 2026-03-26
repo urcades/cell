@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pi_rust_plugin_host::{PluginContentBlock, PluginHost, PluginHostConfig};
-use pi_rust_plugins::{LifecycleEventV1, LifecycleHookContextV1};
+use cell_plugin_host::{PluginContentBlock, PluginHost, PluginHostConfig};
+use cell_plugins::{LifecycleEventV1, LifecycleHookContextV1};
 use serde_json::json;
 
 #[test]

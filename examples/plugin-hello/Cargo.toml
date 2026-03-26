@@ -6,11 +6,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pi-rust-plugin-protocol = { path = "../../crates/pi-rust-plugin-protocol" }
-pi-rust-plugins = { path = "../../crates/pi-rust-plugins" }
+cell-plugin-protocol = { path = "../../crates/cell-plugin-protocol" }
+cell-plugins = { path = "../../crates/cell-plugins" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 
 [dev-dependencies]
-pi-rust-plugin-host = { path = "../../crates/pi-rust-plugin-host" }
+cell-plugin-host = { path = "../../crates/cell-plugin-host" }
 tempfile = "3.19.0"

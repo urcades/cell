@@ -15,6 +15,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "cell-jsonline-transport"
+version = "0.52.12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cell-plugin-host"
+version = "0.52.12"
+dependencies = [
+ "cell-jsonline-transport",
+ "cell-plugin-protocol",
+ "cell-plugins",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "walkdir",
+]
+
+[[package]]
+name = "cell-plugin-protocol"
+version = "0.52.12"
+dependencies = [
+ "cell-plugins",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cell-plugins"
+version = "0.52.12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -143,50 +181,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "pi-rust-jsonline-transport"
-version = "0.52.12"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pi-rust-plugin-host"
-version = "0.52.12"
-dependencies = [
- "pi-rust-jsonline-transport",
- "pi-rust-plugin-protocol",
- "pi-rust-plugins",
- "serde",
- "serde_json",
- "thiserror",
- "walkdir",
-]
-
-[[package]]
-name = "pi-rust-plugin-protocol"
-version = "0.52.12"
-dependencies = [
- "pi-rust-plugins",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pi-rust-plugins"
-version = "0.52.12"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "plugin-hello"
 version = "0.1.0"
 dependencies = [
- "pi-rust-plugin-host",
- "pi-rust-plugin-protocol",
- "pi-rust-plugins",
+ "cell-plugin-host",
+ "cell-plugin-protocol",
+ "cell-plugins",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,5 +1,5 @@
 Usage:
-  pi-rust install <source> [-l]
+  cell install <source> [-l]
 
 Install a package and add it to settings.
 
@@ -7,9 +7,9 @@ Options:
   -l, --local    Install project-locally (.pi/settings.json)
 
 Examples:
-  pi-rust install npm:@foo/bar
-  pi-rust install git:github.com/user/repo
-  pi-rust install git:git@github.com:user/repo
-  pi-rust install https://github.com/user/repo
-  pi-rust install ssh://git@github.com/user/repo
-  pi-rust install ./local/path
+  cell install npm:@foo/bar
+  cell install git:github.com/user/repo
+  cell install git:git@github.com:user/repo
+  cell install https://github.com/user/repo
+  cell install ssh://git@github.com/user/repo
+  cell install ./local/path

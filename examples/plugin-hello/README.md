@@ -1,29 +1,64 @@
 # Hello Plugin Example
 
-This is a standalone Rust plugin example that stays outside the main workspace build.
+This is the smallest complete Rust-native plugin in the repo.
 
-## Layout
+Use it when you want a concrete reference for:
 
-- `Cargo.toml` defines a tiny isolated workspace.
-- `pi-plugin-host.json` describes how the host launches the plugin.
-- `src/main.rs` is the executable entrypoint.
-- `tests/runtime.rs` verifies the live command, tool, and hook paths.
+- descriptor layout
+- handshake and registration
+- one live command
+- one live tool
+- one live hook
 
-## Run it
+## Files
 
-From the repo root:
+- `Cargo.toml`: isolated example workspace
+- `cell-plugin-host.json`: host launch descriptor
+- `src/main.rs`: plugin executable
+- `tests/runtime.rs`: end-to-end runtime test
+
+## Run it from the repo root
+
+Run the example test:
 
 ```bash
-cargo test --manifest-path examples/plugin-hello/Cargo.toml
+cargo test --manifest-path examples/plugin-hello/Cargo.toml --test runtime
 ```
 
-Or launch it through the host:
+Inspect discovery:
 
 ```bash
-cargo run --manifest-path crates/pi-rust-plugin-host/Cargo.toml -- launch examples/plugin-hello/pi-plugin-host.json
+cargo run -p cell-plugin-host -- discover examples/plugin-hello
 ```
 
-## What it does
+Launch it directly:
+
+```bash
+cargo run -p cell-plugin-host -- launch examples/plugin-hello/cell-plugin-host.json
+```
+
+## Load it into `cell`
+
+Add the example directory as a plugin root:
+
+```bash
+cargo run -p cell-cli -- plugins add-root /absolute/path/to/examples/plugin-hello
+```
+
+Inspect the plugin runtime summary:
+
+```bash
+cargo run -p cell-cli -- plugins list
+cargo run -p cell-cli -- plugins list --mode json
+```
+
+Remove the root when you are done:
+
+```bash
+cargo run -p cell-cli -- plugins remove-root /absolute/path/to/examples/plugin-hello
+```
+
+## What the example registers
 
 - Command: `hello`
 - Tool: `echo`

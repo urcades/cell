@@ -12,7 +12,7 @@ import { once } from "node:events";
 const __filename = fileURLToPath(import.meta.url);
 const SCRIPTS_DIR = dirname(__filename);
 const RUST_DIR = dirname(SCRIPTS_DIR);
-const DEFAULT_RUST_BIN = join(RUST_DIR, "target", "debug", "pi-rust");
+const DEFAULT_RUST_BIN = join(RUST_DIR, "target", "debug", "cell");
 
 function resolveTsRepoDir() {
 	const tsRepo = process.env.PI_TS_REPO?.trim();
@@ -305,7 +305,7 @@ if [[ "$1" == "auth" && "$2" == "status" ]]; then
   exit 0
 fi
 if [[ "$1" == "gist" && "$2" == "create" ]]; then
-  printf '%s\n' 'https://gist.github.com/pi-rust/fake-share-id'
+  printf '%s\n' 'https://gist.github.com/cell/fake-share-id'
   exit 0
 fi
 echo "unexpected gh invocation" >&2
@@ -844,7 +844,7 @@ function parseArgs(argv) {
 		runtime: "both",
 		width: 80,
 		height: 24,
-		rustBin: process.env.PI_RUST_BIN || DEFAULT_RUST_BIN,
+		rustBin: process.env.CELL_BIN || DEFAULT_RUST_BIN,
 		scenarios: [],
 	};
 
@@ -1438,7 +1438,7 @@ function makeLauncher(runtime, options, runtimeRoot, tempRoot) {
 		`export HOME=${shQuote(homeDir)}`,
 		`export XDG_CONFIG_HOME=${shQuote(join(homeDir, ".config"))}`,
 		`export XDG_CACHE_HOME=${shQuote(join(homeDir, ".cache"))}`,
-		`export PI_RUST_CODING_AGENT_DIR=${shQuote(join(homeDir, ".pi", "agent"))}`,
+		`export CELL_CODING_AGENT_DIR=${shQuote(join(homeDir, ".pi", "agent"))}`,
 		"export OPENAI_API_KEY='fake-openai-key'",
 	];
 	if (options.extraEnv) {
@@ -1721,7 +1721,7 @@ function readyForScenario(runtime, scenario, text) {
 
 function normalizeText(text, runtimeRoot, tempRoot, branch) {
 	let normalized = text.replaceAll(runtimeRoot, "<REPO>").replaceAll(tempRoot, "<TMP>");
-	normalized = normalized.replace(/pi-rust v\d+\.\d+\.\d+/g, "pi-rust v<VERSION>");
+	normalized = normalized.replace(/cell v\d+\.\d+\.\d+/g, "cell v<VERSION>");
 	normalized = normalized.replace(/π v\d+\.\d+\.\d+/g, "π v<VERSION>");
 	normalized = normalized.replace(
 		/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,

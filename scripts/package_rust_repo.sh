@@ -4,15 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(awk -F'\"' '/^version = \"/ { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
 TARGET_TRIPLE="$(rustc -vV | awk '/^host: / { print $2 }')"
-OUTPUT_PATH="$ROOT_DIR/dist/releases/${VERSION}/pi-rust-${VERSION}-${TARGET_TRIPLE}.tar.gz"
-BINARY_NAME="pi-rust"
+OUTPUT_PATH="$ROOT_DIR/dist/releases/${VERSION}/cell-${VERSION}-${TARGET_TRIPLE}.tar.gz"
+BINARY_NAME="cell"
 
 usage() {
   cat <<'EOF'
 Usage: package_rust_repo.sh [--output <path>]
 
-Build the release pi-rust binary and create a current-platform archive without depending on PI_TS_REPO.
-By default the archive is written to dist/releases/<version>/pi-rust-<version>-<target>.tar.gz.
+Build the release cell binary and create a current-platform archive without depending on PI_TS_REPO.
+By default the archive is written to dist/releases/<version>/cell-<version>-<target>.tar.gz.
 EOF
 }
 
@@ -45,18 +45,18 @@ mkdir -p "$(dirname "$OUTPUT_PATH")"
 
 cd "$ROOT_DIR"
 
-cargo build --release -p pi-rust-cli
+cargo build --release -p cell-cli
 
 STAGING_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGING_DIR"' EXIT
-ARCHIVE_ROOT="pi-rust-${VERSION}-${TARGET_TRIPLE}"
+ARCHIVE_ROOT="cell-${VERSION}-${TARGET_TRIPLE}"
 mkdir -p "$STAGING_DIR/$ARCHIVE_ROOT"
 
 cp "$ROOT_DIR/target/release/$BINARY_NAME" "$STAGING_DIR/$ARCHIVE_ROOT/"
 cp "$ROOT_DIR/README.md" "$STAGING_DIR/$ARCHIVE_ROOT/"
 cp "$ROOT_DIR/CHANGELOG.md" "$STAGING_DIR/$ARCHIVE_ROOT/"
 cp "$ROOT_DIR/LICENSE" "$STAGING_DIR/$ARCHIVE_ROOT/"
-cp "$ROOT_DIR/docs/repo-workflow.md" "$STAGING_DIR/$ARCHIVE_ROOT/"
+cp -R "$ROOT_DIR/docs" "$STAGING_DIR/$ARCHIVE_ROOT/"
 
 export COPYFILE_DISABLE=1
 export COPY_EXTENDED_ATTRIBUTES_DISABLE=1

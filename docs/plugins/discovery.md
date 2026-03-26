@@ -1,9 +1,23 @@
 # Plugin Discovery
 
-`pi-rust` discovers plugins from two kinds of roots:
+`cell` discovers plugins from configured roots and package install roots.
+
+If you are writing a new plugin, the first thing you create is a descriptor file. Discovery exists to find that descriptor.
+
+## Descriptor names
+
+Use `cell-plugin-host.json` for new plugins.
+
+The host also accepts `plugin-host.json` for compatibility, but `cell-plugin-host.json` is the preferred name for current projects.
+
+The descriptor tells the host what executable to launch, which arguments to pass, and which environment overrides to apply.
+
+## Root types
+
+The current discovery system uses two kinds of roots:
 
 - package install roots
-- plugin roots
+- explicit plugin roots
 
 ## Discovery order
 
@@ -16,53 +30,50 @@ The current order is:
 
 Paths are normalized and deduplicated before discovery continues.
 
-## Descriptor files
+## Managing plugin roots
 
-The host looks for either:
-
-- `pi-plugin-host.json`
-- `plugin-host.json`
-
-The descriptor points to an executable plus optional arguments and environment variables.
-
-## Plugin roots
-
-Plugin roots are configured through the Rust-native `plugins` command surface.
-
-Add a root:
+Add a user-scoped root:
 
 ```bash
-pi-rust plugins add-root /path/to/plugin-root
+cargo run -p cell-cli -- plugins add-root /path/to/plugin-root
 ```
 
 Add a project-scoped root:
 
 ```bash
-pi-rust plugins add-root ./plugins --project
+cargo run -p cell-cli -- plugins add-root /path/to/plugin-root --project
 ```
 
 Remove a root:
 
 ```bash
-pi-rust plugins remove-root /path/to/plugin-root
+cargo run -p cell-cli -- plugins remove-root /path/to/plugin-root
 ```
 
-List discovered plugins:
+Inspect discovery results:
 
 ```bash
-pi-rust plugins list
-pi-rust plugins list --mode json
+cargo run -p cell-cli -- plugins list
+cargo run -p cell-cli -- plugins list --mode json
 ```
 
-## Important boundary
+Inspect discovery without the main app:
 
-This discovery system is for Rust-native executable plugins.
+```bash
+cargo run -p cell-plugin-host -- discover /path/to/root
+```
 
-Legacy `--extension` and `--no-extensions` flags are still unsupported for JS/TS execution. They are not the plugin configuration surface.
+## Scope and storage
+
+Project-scoped plugin roots are currently written into `.pi/settings.json`.
+
+That file path is a compatibility holdover. The supported product surface is the `plugins` command group, not the older extension flags.
 
 ## Failure behavior
 
-Discovery problems are warnings, not startup blockers:
+Discovery problems are warnings, not startup blockers.
+
+Typical warnings include:
 
 - unreadable root
 - malformed descriptor

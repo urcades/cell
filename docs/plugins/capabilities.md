@@ -1,36 +1,89 @@
 # Plugin Capabilities
 
-This page is the supported capability matrix for plugin authors.
+This page describes the supported capability classes from the point of view of a plugin author.
 
-## Live today
+## Commands
 
-| Capability | Status | What it means |
-| --- | --- | --- |
-| Commands | Live | The host can invoke plugin commands and use them in command discovery surfaces. |
-| Tools | Live | The host can invoke plugin tools during normal agent tool execution. |
-| Hooks | Live | The host can dispatch supported lifecycle events to plugins. |
+Commands are live.
 
-## Declared, but not part of the supported author story
+A command plugin can:
 
-| Capability | Status | What it means |
-| --- | --- | --- |
-| Flags | Declared only | Flag metadata can be registered, but there is no supported live flag flow yet. |
-| Providers | Deferred | Registration is accepted and summarized, but provider execution is not live. |
-| Models | Deferred | Registration is accepted and summarized, but model execution is not live. |
+- register a command name
+- describe parameters
+- stay hidden or visible
+- receive a `command_request`
+- reply with replacement text or an error
+
+Practical effect:
+
+- plugin commands appear in command discovery surfaces
+- plugin commands can be invoked by the host
+- built-in command names still win when names collide
+
+## Tools
+
+Tools are live.
+
+A tool plugin can:
+
+- register a tool name
+- define structured parameters
+- declare an output kind
+- receive a `tool_request`
+- reply with structured content blocks or an error
+
+Practical effect:
+
+- plugin tools participate in the normal tool execution path
+- plugin tool failures become tool errors or warnings, not host crashes
+
+## Hooks
+
+Hooks are live.
+
+A hook plugin can:
+
+- register one or more lifecycle events
+- set a priority
+- receive a `hook_request`
+- reply with `continue` or `stopPropagation`
+
+Practical effect:
+
+- hooks run synchronously in merged hook order
+- hook warnings do not crash the app
+- `stopPropagation` only stops later hooks for that same event
+
+## Flags
+
+Flags are declared but not yet a supported live author surface.
+
+Today they are:
+
+- accepted in the manifest
+- visible in diagnostics and summaries
+- not yet bound into a live runtime flag path
+
+## Providers and models
+
+Provider and model registrations are accepted and summarized, but not executed.
+
+That means:
+
+- the host can validate and report them
+- the current runtime does not route real provider or model execution through plugins
 
 ## Rules that matter in practice
 
-- Capability names must be unique after merge
+- Capability names must stay unique after merge
 - Duplicate command, tool, provider, or model names are rejected
-- Hidden commands stay out of the normal command surfaces
+- Hidden commands and tools stay out of normal user-facing discovery
 - Warnings are surfaced without crashing the app
 
-## Current product boundary
+## Supported author target today
 
-If you want a plugin that actually runs today, build around:
+If you want a plugin that runs today, build around:
 
 - commands
 - tools
 - hooks
-
-If you want provider or model execution, that is future work and should not be treated as a currently supported path.

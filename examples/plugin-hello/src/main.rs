@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::io::{self, BufRead, Write};
 
-use pi_rust_plugin_protocol::{
+use cell_plugin_protocol::{
     HostMessage, PluginContentBlock, PluginMessage, PLUGIN_PROTOCOL_VERSION_V1,
 };
-use pi_rust_plugins::{
+use cell_plugins::{
     CommandRegistrationV1, LifecycleEventV1, LifecycleHookOutcomeV1,
     LifecycleHookRegistrationV1, ParameterRegistrationV1, PluginIdentityV1, PluginManifestV1,
     ToolRegistrationV1, ValueKindV1,
@@ -99,7 +99,7 @@ fn manifest() -> PluginManifestV1 {
         name: "Hello Plugin".to_string(),
         version: "0.1.0".to_string(),
         description: Some("Standalone Rust plugin example".to_string()),
-        authors: vec!["pi-rust".to_string()],
+        authors: vec!["cell".to_string()],
         homepage: None,
         repository: None,
         license: Some("MIT".to_string()),

@@ -1,0 +1,12 @@
+[package]
+name = "cell-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cell-ai-core = { path = "../cell-ai-core" }
+serde.workspace = true
+serde_json.workspace = true

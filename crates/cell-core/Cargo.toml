@@ -1,0 +1,33 @@
+[package]
+name = "cell-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cell-ai-core = { path = "../cell-ai-core" }
+cell-ai-providers = { path = "../cell-ai-providers" }
+cell-config = { path = "../cell-config" }
+cell-models = { path = "../cell-models" }
+cell-oauth = { path = "../cell-oauth" }
+cell-packages = { path = "../cell-packages" }
+cell-plugin-host = { path = "../cell-plugin-host" }
+cell-plugins = { path = "../cell-plugins" }
+cell-protocol = { path = "../cell-protocol" }
+cell-resources = { path = "../cell-resources" }
+cell-session = { path = "../cell-session" }
+cell-tools = { path = "../cell-tools" }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+cell-plugins = { path = "../cell-plugins" }
+tempfile.workspace = true

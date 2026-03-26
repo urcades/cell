@@ -1,0 +1,17 @@
+[package]
+name = "cell-resources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cell-config = { path = "../cell-config" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

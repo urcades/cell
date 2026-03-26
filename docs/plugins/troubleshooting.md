@@ -5,44 +5,39 @@
 Check these first:
 
 - the root you added actually contains a descriptor
-- the descriptor file is named `pi-plugin-host.json` or `plugin-host.json`
-- you added the correct root with `pi-rust plugins add-root`
+- the descriptor file is named `cell-plugin-host.json` or `plugin-host.json`
+- you added the correct root with `plugins add-root`
 
-Use:
-
-```bash
-pi-rust plugins list --mode json
-```
-
-or:
+Useful commands:
 
 ```bash
-pi-rust-plugin-host discover /path/to/root
+cargo run -p cell-cli -- plugins list --mode json
+cargo run -p cell-plugin-host -- discover /path/to/root
 ```
 
 ## The plugin launches but is rejected
 
 Common causes:
 
-- descriptor id does not match manifest id
-- wrong protocol version
-- wrong manifest version
+- descriptor id does not match manifest plugin id
+- unsupported protocol version
+- unsupported manifest version
 - duplicate capability names
 - malformed JSON on stdout
 
 Use:
 
 ```bash
-pi-rust-plugin-host launch /path/to/pi-plugin-host.json
+cargo run -p cell-plugin-host -- launch /path/to/cell-plugin-host.json
 ```
 
 That gives the clearest startup summary.
 
 ## The plugin prints to stderr
 
-Stderr noise is allowed. It does not block registration by itself.
+Stderr output is allowed.
 
-If the plugin also hangs, crashes, or sends malformed output, the host reports that as a warning.
+It does not fail registration by itself. The host only warns or rejects when there is a real launch, timeout, or protocol problem alongside it.
 
 ## The plugin times out
 
@@ -56,7 +51,7 @@ If a command, tool, or hook takes too long:
 
 ## `cargo run` plugins fail when you isolate `HOME`
 
-If you test plugin roots with a temporary `HOME`, `cargo run` may stop finding the Rust toolchain.
+If you test plugins with a temporary `HOME`, `cargo run` may stop finding the Rust toolchain.
 
 Preserve:
 
@@ -68,8 +63,22 @@ and isolate only:
 - `HOME`
 - `XDG_CONFIG_HOME`
 
-## JS/TS extensions do not run
+## Commands or tools do not appear where you expect
+
+Check these points:
+
+- hidden commands and hidden tools stay out of normal discovery surfaces
+- duplicate names are rejected during merge
+- built-in command names still win when a plugin tries to reuse them
+
+Use plugin diagnostics first:
+
+```bash
+cargo run -p cell-cli -- plugins list --mode json
+```
+
+## JS and TS extensions do not run
 
 That is expected.
 
-`pi-rust` does not embed the TypeScript extension runtime. Rust-native executable plugins are the supported direction.
+`cell` does not embed the TypeScript extension runtime. Rust-native executable plugins are the supported path.

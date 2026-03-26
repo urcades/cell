@@ -14,4 +14,4 @@ EOF
 
 production_warning_gate
 cargo test --workspace
-env -u PI_TS_REPO cargo test -p pi-rust-cli --test tui_parity
+env -u PI_TS_REPO cargo test -p cell-cli --test tui_parity

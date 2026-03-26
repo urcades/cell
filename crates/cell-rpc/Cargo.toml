@@ -1,0 +1,22 @@
+[package]
+name = "cell-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cell-ai-core = { path = "../cell-ai-core" }
+cell-core = { path = "../cell-core" }
+cell-jsonline-transport = { path = "../cell-jsonline-transport" }
+cell-protocol = { path = "../cell-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+cell-ai-providers = { path = "../cell-ai-providers" }
+cell-models = { path = "../cell-models" }
+cell-oauth = { path = "../cell-oauth" }
+tempfile.workspace = true

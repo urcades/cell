@@ -1,12 +1,12 @@
 # Plugin Quickstart
 
-This is the fastest working path for a new plugin author.
+This is the fastest working path from zero to a live plugin.
 
 ## 1. Start from the example plugin
 
-Use [examples/plugin-hello](../../examples/plugin-hello).
+Use `examples/plugin-hello`.
 
-It already includes:
+It already contains:
 
 - a descriptor file
 - a Rust executable
@@ -15,73 +15,89 @@ It already includes:
 - one tool
 - one hook
 
-## 2. Build and test the example
+## 2. Run the example test
 
-From the Rust repo root:
+From the repo root:
 
 ```bash
 cargo test --manifest-path examples/plugin-hello/Cargo.toml --test runtime
 ```
 
-## 3. Inspect it with the host
+That proves the example still supports live command, tool, and hook dispatch.
 
-Discover the descriptor:
-
-```bash
-cargo run --manifest-path crates/pi-rust-plugin-host/Cargo.toml -- discover examples/plugin-hello
-```
-
-Launch it directly:
+## 3. Inspect discovery
 
 ```bash
-cargo run --manifest-path crates/pi-rust-plugin-host/Cargo.toml -- launch examples/plugin-hello/pi-plugin-host.json
+cargo run -p cell-plugin-host -- discover examples/plugin-hello
 ```
 
-The launch summary should show one command, one tool, and one hook.
+You should see the descriptor path and the launch settings for `Hello Plugin`.
 
-## 4. Add the plugin root to `pi-rust`
+## 4. Launch the plugin directly
+
+```bash
+cargo run -p cell-plugin-host -- launch examples/plugin-hello/cell-plugin-host.json
+```
+
+The summary should show:
+
+- one command
+- one tool
+- one hook
+
+The example behavior is intentionally simple:
+
+- command `hello` rewrites its arguments into `hello:<arg>|<arg>`
+- tool `echo` returns `tool:<text>`
+- hook `session-started` listens to the `sessionStarted` lifecycle event
+
+## 5. Add the plugin root to `cell`
 
 User scope:
 
 ```bash
-pi-rust plugins add-root /absolute/path/to/examples/plugin-hello
+cargo run -p cell-cli -- plugins add-root /absolute/path/to/examples/plugin-hello
 ```
 
 Project scope:
 
 ```bash
-pi-rust plugins add-root ./relative/path/to/plugin-root --project
+cargo run -p cell-cli -- plugins add-root /absolute/path/to/examples/plugin-hello --project
 ```
 
-## 5. Inspect what the app sees
+## 6. Inspect what the app sees
 
-Human-readable summary:
+Human-readable diagnostics:
 
 ```bash
-pi-rust plugins list
+cargo run -p cell-cli -- plugins list
 ```
 
-Machine-readable summary:
+Machine-readable diagnostics:
 
 ```bash
-pi-rust plugins list --mode json
+cargo run -p cell-cli -- plugins list --mode json
 ```
 
-## 6. Remove the root when you are done
+If you want to see the example outside the app UI, the example runtime test is the clearest demonstration of the live behavior. It asserts that:
+
+- `hello Ada Lovelace` becomes `hello:Ada|Lovelace`
+- tool input `{ "text": "Ada" }` becomes `tool:Ada`
+- the `sessionStarted` hook dispatch completes without warnings
+
+## 7. Remove the root when you are done
 
 ```bash
-pi-rust plugins remove-root /absolute/path/to/examples/plugin-hello
+cargo run -p cell-cli -- plugins remove-root /absolute/path/to/examples/plugin-hello
 ```
 
-## Folder layout
-
-The example plugin uses this layout:
+## Example layout
 
 ```text
 examples/plugin-hello/
 ├── Cargo.toml
 ├── README.md
-├── pi-plugin-host.json
+├── cell-plugin-host.json
 ├── src/
 │   └── main.rs
 └── tests/
@@ -90,6 +106,7 @@ examples/plugin-hello/
 
 ## Next reading
 
+- [Authoring](./authoring.md)
 - [Discovery](./discovery.md)
 - [Protocol](./protocol.md)
 - [Capabilities](./capabilities.md)

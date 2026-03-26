@@ -3,7 +3,7 @@ set -euo pipefail
 
 RUST_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES_DIR="$RUST_ROOT/fixtures/cli"
-RUST_BIN="${PI_RUST_BIN:-$RUST_ROOT/target/debug/pi-rust}"
+RUST_BIN="${CELL_BIN:-$RUST_ROOT/target/debug/cell}"
 UPSTREAM_HELP="$FIXTURES_DIR/upstream-help.txt"
 UPSTREAM_VERSION="$FIXTURES_DIR/upstream-version.txt"
 INSTALL_HELP="$FIXTURES_DIR/install-help.txt"
@@ -83,7 +83,7 @@ capture_expected_failure_stderr() {
 
 (
   cd "$RUST_ROOT"
-  cargo build -q -p pi-rust-cli
+  cargo build -q -p cell-cli
   capture_optional_stdout "$INSTALL_HELP" \
     "$RUST_BIN" install --help
   capture_expected_failure_stderr "$INSTALL_INVALID_OPTION_STDERR" \

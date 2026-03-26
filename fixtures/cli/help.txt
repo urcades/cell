@@ -1,20 +1,20 @@
-pi-rust - AI coding assistant with read, bash, edit, write tools
+cell - AI coding assistant with read, bash, edit, write tools
 
 Usage:
-  pi-rust [options] [@files...] [messages...]
+  cell [options] [@files...] [messages...]
 
 Commands:
-  pi-rust install <source> [-l]    Install package source and add to settings
-  pi-rust remove <source> [-l]     Remove package source from settings
-  pi-rust update [source]          Update installed packages (skips pinned sources)
-  pi-rust list                     List installed packages from settings
-  pi-rust plugins list             List plugin runtime diagnostics
-  pi-rust plugins add-root <path> [-l|--project]
+  cell install <source> [-l]    Install package source and add to settings
+  cell remove <source> [-l]     Remove package source from settings
+  cell update [source]          Update installed packages (skips pinned sources)
+  cell list                     List installed packages from settings
+  cell plugins list             List plugin runtime diagnostics
+  cell plugins add-root <path> [-l|--project]
                                    Add a plugin root to settings
-  pi-rust plugins remove-root <path> [-l|--project]
+  cell plugins remove-root <path> [-l|--project]
                                    Remove a plugin root from settings
-  pi-rust config                   Open TUI to enable/disable package resources
-  pi-rust <command> --help         Show help for install/remove/update/list/plugins
+  cell config                   Open TUI to enable/disable package resources
+  cell <command> --help         Show help for install/remove/update/list/plugins
 
 Options:
   --provider <name>              Provider name (optional; inferred from model/auth)
@@ -54,57 +54,57 @@ Plugins can register additional flags (e.g., --plan from plan-mode plugin).
 
 Examples:
   # Interactive mode
-  pi-rust
+  cell
 
   # Interactive mode with initial prompt
-  pi-rust "List all .ts files in src/"
+  cell "List all .ts files in src/"
 
   # Include files in initial message
-  pi-rust @prompt.md @image.png "What color is the sky?"
+  cell @prompt.md @image.png "What color is the sky?"
 
   # Non-interactive mode (process and exit)
-  pi-rust -p "List all .ts files in src/"
+  cell -p "List all .ts files in src/"
 
   # Multiple messages (interactive)
-  pi-rust "Read package.json" "What dependencies do we have?"
+  cell "Read package.json" "What dependencies do we have?"
 
   # Continue previous session
-  pi-rust --continue "What did we discuss?"
+  cell --continue "What did we discuss?"
 
   # Use different model
-  pi-rust --provider openai --model gpt-4o-mini "Help me refactor this code"
+  cell --provider openai --model gpt-4o-mini "Help me refactor this code"
 
   # Use model with provider prefix (no --provider needed)
-  pi-rust --model openai/gpt-4o "Help me refactor this code"
+  cell --model openai/gpt-4o "Help me refactor this code"
 
   # Use model with thinking level shorthand
-  pi-rust --model sonnet:high "Solve this complex problem"
+  cell --model sonnet:high "Solve this complex problem"
 
   # Limit model cycling to specific models
-  pi-rust --models claude-sonnet,claude-haiku,gpt-4o
+  cell --models claude-sonnet,claude-haiku,gpt-4o
 
   # Limit to a specific provider with glob pattern
-  pi-rust --models "openrouter/*"
+  cell --models "openrouter/*"
 
   # Cycle models with fixed thinking levels
-  pi-rust --models sonnet:high,haiku:low
+  cell --models sonnet:high,haiku:low
 
   # Start with a specific thinking level
-  pi-rust --thinking high "Solve this complex problem"
+  cell --thinking high "Solve this complex problem"
 
   # Read-only mode (no file modifications possible)
-  pi-rust --tools read,grep,find,ls -p "Review the code in src/"
+  cell --tools read,grep,find,ls -p "Review the code in src/"
 
   # Export a session file to HTML
-  pi-rust --export ~/.pi-rust/agent/sessions/--path--/session.jsonl
-  pi-rust --export session.jsonl output.html
+  cell --export ~/.cell/agent/sessions/--path--/session.jsonl
+  cell --export session.jsonl output.html
 
 Environment Variables:
   ANTHROPIC_API_KEY                - Anthropic Claude API key
   ANTHROPIC_OAUTH_TOKEN            - Anthropic OAuth token (alternative to API key)
   OPENAI_API_KEY                   - OpenAI GPT API key
   OPENROUTER_API_KEY               - OpenRouter API key
-  PI_RUST_CODING_AGENT_DIR         - Session storage directory (default: ~/.pi-rust/agent)
+  CELL_CODING_AGENT_DIR         - Session storage directory (default: ~/.cell/agent)
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
 

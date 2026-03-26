@@ -4,7 +4,7 @@ set -euo pipefail
 RUST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="${RUST_ROOT}/fixtures/tui"
 RUNNER="${RUST_ROOT}/scripts/tui_parity_runner.mjs"
-RUST_BIN="${PI_RUST_BIN:-${RUST_ROOT}/target/debug/pi-rust}"
+RUST_BIN="${CELL_BIN:-${RUST_ROOT}/target/debug/cell}"
 if [[ -n "${PI_TUI_RUNTIME:-}" ]]; then
   RUNTIME="${PI_TUI_RUNTIME}"
 elif [[ -n "${PI_TS_REPO:-}" ]]; then

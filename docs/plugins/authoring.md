@@ -2,11 +2,23 @@
 
 This guide shows the minimum shape of a Rust-native plugin that works with the current host.
 
+## Authoring model
+
+A plugin has three moving parts:
+
+1. a descriptor file that tells the host how to launch it
+2. an executable that speaks the plugin protocol over stdio
+3. a registration manifest that describes its capabilities
+
+The best starting point is still the runnable example under `examples/plugin-hello`.
+
 ## 1. Create a descriptor
 
-The host looks for `pi-plugin-host.json` or `plugin-host.json`.
+The preferred descriptor name is `cell-plugin-host.json`.
 
-Each descriptor points to an executable and optional arguments:
+The host also accepts `plugin-host.json` for compatibility, but new plugins should use the `cell-plugin-host.json` name.
+
+A minimal descriptor looks like this:
 
 ```json
 {
@@ -18,58 +30,103 @@ Each descriptor points to an executable and optional arguments:
 }
 ```
 
-The descriptor directory becomes the default working directory unless `workingDirectory` is set.
+Important rules:
 
-## 2. Write a real executable
+- the descriptor `id` must match the manifest plugin id
+- the descriptor directory becomes the default working directory unless `workingDirectory` is set
+- the executable can be a compiled binary or a wrapper command like `cargo run`
+- relative paths in `args` and environment values are evaluated by the launched process from that working directory
 
-The plugin entrypoint can be a compiled Rust binary, or a wrapper that launches one.
-For the example in this repo, the descriptor runs `cargo run` inside the example directory so the plugin stays outside the main workspace build.
+## 2. Build a real executable
 
-## 3. Complete the handshake
+The plugin process must:
 
-The host sends one `HandshakeRequest` line first.
-The plugin must answer with a `Registration` message that includes:
+- read one JSON message per line from stdin
+- write one JSON message per line to stdout
+- keep stderr for logs only
+- stay alive long enough to answer startup and runtime requests
+
+For the example in this repo, the descriptor runs `cargo run` so the plugin stays outside the main workspace build.
+
+## 3. Answer the handshake
+
+The host sends `handshake_request` first.
+
+The plugin must answer with `registration`, including:
 
 - `protocolVersion: 1`
-- a manifest whose `manifestVersion` is also `1`
+- `manifestVersion: 1`
 - a plugin identity whose `id` matches the descriptor id
 
-If the plugin sends anything else, the host treats startup as a failure.
+If startup sends anything else, the host rejects the plugin.
 
 ## 4. Register capabilities
 
-The manifest can register commands, tools, flags, hooks, providers, and models.
+The manifest can declare commands, tools, flags, hooks, providers, and models.
 
-The current runtime classes are split like this:
+Supported live author target today:
 
-- Commands, tools, and lifecycle hooks are live and dispatchable.
-- Flags are carried in the manifest and startup summary, but they are not yet bound into a live plugin flag surface.
-- Providers and models are accepted and merged, but execution is still deferred.
+- commands
+- tools
+- hooks
 
-Duplicate names are rejected during registration or runtime merge.
+Accepted but not yet live:
 
-## 5. Keep the message loop simple
+- flags as a runtime surface
+- providers
+- models
 
-After registration, the host sends request messages for commands, tools, hooks, and shutdown.
-A plugin should:
+Duplicate capability names are rejected during validation or merge.
 
-- read one line at a time from stdin
-- parse the JSON payload
-- respond on stdout with the matching request id
-- ignore or log unexpected messages instead of crashing when possible
+## 5. Keep the message loop small and predictable
 
-## 6. Test the plugin
+A good first plugin should:
 
-Run the example host launch path from the repo root:
+- parse one message at a time
+- match on message type
+- answer each request with the same `requestId`
+- return structured errors instead of panicking when possible
+- exit cleanly after `shutdown_request`
+
+Do not start with a complex background runtime. Start with a tight request-response loop and add behavior only after the basic host path is reliable.
+
+## 6. Test it early
+
+Useful checks from the repo root:
 
 ```bash
-cargo run --manifest-path crates/pi-rust-plugin-host/Cargo.toml -- launch examples/plugin-hello/pi-plugin-host.json
+cargo test --manifest-path examples/plugin-hello/Cargo.toml --test runtime
+cargo run -p cell-plugin-host -- discover examples/plugin-hello
+cargo run -p cell-plugin-host -- launch examples/plugin-hello/cell-plugin-host.json
 ```
 
-Or run the example crate directly:
+Then add the plugin root to the main app and inspect diagnostics:
 
 ```bash
-cargo test --manifest-path examples/plugin-hello/Cargo.toml
+cargo run -p cell-cli -- plugins add-root /absolute/path/to/plugin-root
+cargo run -p cell-cli -- plugins list --mode json
 ```
 
-The example crate includes an integration test that exercises the live command, tool, and hook paths.
+## 7. Know the support boundary
+
+What works today:
+
+- command execution
+- tool execution
+- hook execution
+
+What is deferred:
+
+- provider execution
+- model execution
+- plugin-defined runtime flags as a live surface
+
+What is out of scope:
+
+- JavaScript and TypeScript extension execution
+- Node or Bun embedding
+- injected custom UI
+
+## Best next step
+
+If you are starting a real plugin, copy the example plugin structure first and change one thing at a time.
