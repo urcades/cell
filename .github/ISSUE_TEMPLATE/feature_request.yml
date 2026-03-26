@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose an improvement to the Rust-native Cell CLI, TUI, or plugin workflow.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What is hard, missing, or confusing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the behavior you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Share workarounds or other approaches you considered.
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Add examples, mockups, or related links if helpful.

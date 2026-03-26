@@ -9,3 +9,8 @@ target/
 .vscode/
 .idea/
 .zed/
+
+# Local compatibility state and release artifacts stay out of git.
+.pi/
+crates/cell-cli/.pi/
+dist/

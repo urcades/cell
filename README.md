@@ -181,6 +181,13 @@ dist/releases/<version>/cell-<version>-<target>.tar.gz
 dist/releases/<version>/cell-<version>-<target>.tar.gz.sha256
 ```
 
+## Contributing and support
+
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md): how to set up, verify, and submit changes
+- [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md): expectations for community participation
+- [`SECURITY.md`](./SECURITY.md): how to report security issues privately
+- [`SUPPORT.md`](./SUPPORT.md): where to ask for help and what to include in bug reports
+
 ## Documentation map
 
 - [`docs/README.md`](./docs/README.md): documentation index
