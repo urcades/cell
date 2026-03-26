@@ -1,25 +1,30 @@
-# Extension Capability Matrix
+# Plugin Capability Matrix
 
-This document tracks the remaining product-parity work around extensions and resource loading.
+This document tracks the live-versus-deferred split for the Rust plugin host.
 
-## Fixable now
+## Live capability classes
 
-- Skills, prompts, themes, and context resources loaded from global, project, and package roots
-- Package install, remove, update, and list flows
-- Startup and reload surfacing for static resources
-- RPC control-plane parity around abort handling
-- Pure-Rust plugin v1 contract for manifest, command/tool/flag registration, lifecycle hooks, and provider/model registration
+- Descriptor discovery from `pi-plugin-host.json` and `plugin-host.json`
+- Handshake and manifest registration over stdio
+- Command dispatch
+- Tool dispatch
+- Lifecycle hook dispatch
+- Startup diagnostics and duplicate capability rejection
 
-## Still different but fixable
+## Deferred capability classes
 
-- Plugin loading and dispatch from the pure-Rust contract are still deferred
-- Per-package manifest and resource filtering semantics
-- A true `Resource Configuration` surface with per-item enable and disable behavior
-- Broader end-to-end proof for provider auth, share/export, and package resource configuration
+- Plugin flags as a live CLI/runtime surface
+- Provider execution
+- Model execution
+- Per-package manifest and resource filtering semantics for plugin runtime behaviors
+- Custom UI surfaces
 
-## Inherent mismatch / stop here
+## Inherent mismatch
 
-- Executing JS/TS extensions directly with Node runtime semantics
-- Reproducing the full TypeScript extension runtime as-is, including JS handlers, event bus behavior, and injected custom UI surfaces
+- Embedding the TypeScript extension runtime or executing JS/TS extensions directly
 
-`pi-rust` stays pure Rust. Extension parity means matching capability classes in Rust where that is practical and user-visible, not embedding the TypeScript runtime.
+## Notes
+
+- Provider and model registrations are already accepted and merged, but they are not dispatched yet.
+- Flags are already part of the manifest and startup summary, but they are not wired into a live plugin flag surface yet.
+- `pi-rust` stays pure Rust; parity means matching the practical capability class, not reproducing the TypeScript runtime literally.

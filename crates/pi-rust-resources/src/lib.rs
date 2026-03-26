@@ -6,14 +6,26 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use pi_rust_config::PROJECT_CONFIG_DIR_NAME;
-use pi_rust_config::{SettingsManager, SettingsScope, get_agent_dir, get_project_config_dir};
+use pi_rust_config::{
+    SettingsManager, SettingsScope, Value, get_agent_dir, get_project_config_dir,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
 pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &["skills", "prompts", "themes", "agents", "system"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceKind {
+    Skills,
+    Prompts,
+    Themes,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct PiManifest {
+    #[serde(default)]
+    #[serde(rename = "extensions")]
+    _extensions: Option<Vec<String>>,
     #[serde(default)]
     skills: Option<Vec<String>>,
     #[serde(default)]
@@ -45,6 +57,32 @@ pub struct DiscoveredResources {
     pub skills: Vec<ScopedPath>,
     pub prompts: Vec<ScopedPath>,
     pub themes: Vec<ScopedPath>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceOrigin {
+    TopLevel { root: PathBuf },
+    Package { root: PathBuf },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceCatalogEntry {
+    pub path: PathBuf,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceCatalogGroup {
+    pub scope: ResourceScope,
+    pub origin: ResourceOrigin,
+    pub entries: Vec<ResourceCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceCatalog {
+    pub skills: Vec<ResourceCatalogGroup>,
+    pub prompts: Vec<ResourceCatalogGroup>,
+    pub themes: Vec<ResourceCatalogGroup>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,6 +164,14 @@ pub fn discover_resources(
     agent_dir: Option<PathBuf>,
 ) -> DiscoveredResources {
     discover_resources_with_options(&ResourceDiscoveryOptions {
+        cwd: cwd.as_ref().to_path_buf(),
+        agent_dir,
+        ..ResourceDiscoveryOptions::default()
+    })
+}
+
+pub fn catalog_resources(cwd: impl AsRef<Path>, agent_dir: Option<PathBuf>) -> ResourceCatalog {
+    catalog_resources_with_options(&ResourceDiscoveryOptions {
         cwd: cwd.as_ref().to_path_buf(),
         agent_dir,
         ..ResourceDiscoveryOptions::default()
@@ -227,6 +273,81 @@ pub fn discover_resources_with_options(options: &ResourceDiscoveryOptions) -> Di
     );
 
     resources
+}
+
+pub fn catalog_resources_with_options(options: &ResourceDiscoveryOptions) -> ResourceCatalog {
+    let agent_dir = options.agent_dir.clone().unwrap_or_else(get_agent_dir);
+    catalog_resources_internal(&options.cwd, &agent_dir, home_dir().as_deref(), options)
+}
+
+pub fn toggle_scoped_resource_entry(
+    settings_manager: &mut SettingsManager,
+    scope: SettingsScope,
+    kind: ResourceKind,
+    entry: impl AsRef<Path>,
+    enabled: bool,
+) -> Result<bool, pi_rust_config::SettingsManagerError> {
+    let key = resource_kind_key(kind);
+    let target = normalize_resource_entry_path(entry.as_ref());
+    settings_manager.transact_scoped_settings(scope, |settings| {
+        let object = settings
+            .as_object_mut()
+            .expect("load_settings guarantees root object");
+        let current = object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|values| values.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        let next = toggle_exact_resource_entries(&current, &target, enabled);
+        let changed = next != current;
+        if next.is_empty() {
+            object.remove(key);
+        } else {
+            object.insert(
+                key.to_string(),
+                Value::Array(next.into_iter().map(Value::String).collect()),
+            );
+        }
+        Ok(changed)
+    })
+}
+
+pub fn toggle_exact_resource_entries(
+    entries: &[String],
+    target: &str,
+    enabled: bool,
+) -> Vec<String> {
+    let target = normalize_resource_entry(target);
+    let mut next = Vec::new();
+    let mut replaced = false;
+
+    for entry in entries {
+        if normalize_resource_entry(entry) == target {
+            if !replaced {
+                next.push(if enabled {
+                    format!("+{target}")
+                } else {
+                    format!("-{target}")
+                });
+                replaced = true;
+            }
+            continue;
+        }
+        next.push(entry.clone());
+    }
+
+    if !replaced {
+        next.push(if enabled {
+            format!("+{target}")
+        } else {
+            format!("-{target}")
+        });
+    }
+
+    next
 }
 
 pub fn load_discovered_resources(discovered: &DiscoveredResources) -> LoadedResources {
@@ -441,6 +562,556 @@ pub fn load_append_system_prompt(
     Ok(Some(ContextDocument { path, content }))
 }
 
+#[derive(Clone, Copy)]
+enum CatalogResourceKind {
+    Skills,
+    Prompts,
+    Themes,
+}
+
+#[derive(Clone, Copy)]
+struct CatalogSeenEntry {
+    kind: CatalogResourceKind,
+    scope: ResourceScope,
+    group_index: usize,
+    entry_index: usize,
+}
+
+#[derive(Default)]
+struct ResourceCatalogBuilder {
+    catalog: ResourceCatalog,
+    seen: HashMap<PathBuf, CatalogSeenEntry>,
+}
+
+impl ResourceCatalogBuilder {
+    fn groups(&self, kind: CatalogResourceKind) -> &Vec<ResourceCatalogGroup> {
+        match kind {
+            CatalogResourceKind::Skills => &self.catalog.skills,
+            CatalogResourceKind::Prompts => &self.catalog.prompts,
+            CatalogResourceKind::Themes => &self.catalog.themes,
+        }
+    }
+
+    fn groups_mut(&mut self, kind: CatalogResourceKind) -> &mut Vec<ResourceCatalogGroup> {
+        match kind {
+            CatalogResourceKind::Skills => &mut self.catalog.skills,
+            CatalogResourceKind::Prompts => &mut self.catalog.prompts,
+            CatalogResourceKind::Themes => &mut self.catalog.themes,
+        }
+    }
+
+    fn push_group(
+        &mut self,
+        kind: CatalogResourceKind,
+        scope: ResourceScope,
+        origin: ResourceOrigin,
+    ) -> usize {
+        let groups = self.groups_mut(kind);
+        groups.push(ResourceCatalogGroup {
+            scope,
+            origin,
+            entries: Vec::new(),
+        });
+        groups.len() - 1
+    }
+
+    fn push_entry(
+        &mut self,
+        kind: CatalogResourceKind,
+        group_index: usize,
+        path: PathBuf,
+        enabled: bool,
+    ) {
+        let scope = self.groups(kind)[group_index].scope;
+        if !enabled {
+            self.groups_mut(kind)[group_index]
+                .entries
+                .push(ResourceCatalogEntry {
+                    path,
+                    enabled: false,
+                });
+            return;
+        }
+
+        if let Some(previous) = self.seen.get(&path).copied() {
+            if scope_rank(scope) > scope_rank(previous.scope) {
+                self.groups_mut(previous.kind)[previous.group_index].entries
+                    [previous.entry_index]
+                    .enabled = false;
+                let entry_index = {
+                    let groups = self.groups_mut(kind);
+                    let entry_index = groups[group_index].entries.len();
+                    groups[group_index].entries.push(ResourceCatalogEntry {
+                        path: path.clone(),
+                        enabled: true,
+                    });
+                    entry_index
+                };
+                self.seen.insert(
+                    path,
+                    CatalogSeenEntry {
+                        kind,
+                        scope,
+                        group_index,
+                        entry_index,
+                    },
+                );
+                return;
+            }
+
+            self.groups_mut(kind)[group_index]
+                .entries
+                .push(ResourceCatalogEntry {
+                    path,
+                    enabled: false,
+                });
+            return;
+        }
+
+        let entry_index = {
+            let groups = self.groups_mut(kind);
+            let entry_index = groups[group_index].entries.len();
+            groups[group_index].entries.push(ResourceCatalogEntry {
+                path: path.clone(),
+                enabled: true,
+            });
+            entry_index
+        };
+        self.seen.insert(
+            path,
+            CatalogSeenEntry {
+                kind,
+                scope,
+                group_index,
+                entry_index,
+            },
+        );
+    }
+
+    fn finish(self) -> ResourceCatalog {
+        self.catalog
+    }
+
+    fn set_entry_enabled(
+        &mut self,
+        kind: CatalogResourceKind,
+        scope: ResourceScope,
+        path: &Path,
+        enabled: bool,
+    ) -> bool {
+        for group in self.groups_mut(kind) {
+            if group.scope != scope {
+                continue;
+            }
+            if let Some(entry) = group.entries.iter_mut().find(|entry| entry.path == path) {
+                entry.enabled = enabled;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn catalog_resources_internal(
+    cwd: &Path,
+    agent_dir: &Path,
+    home: Option<&Path>,
+    options: &ResourceDiscoveryOptions,
+) -> ResourceCatalog {
+    let mut builder = ResourceCatalogBuilder::default();
+    let project_base = get_project_config_dir(cwd);
+
+    if !options.no_skills {
+        add_top_level_catalog_group(
+            &mut builder,
+            CatalogResourceKind::Skills,
+            ResourceScope::Global,
+            ResourceOrigin::TopLevel {
+                root: agent_dir.join("skills"),
+            },
+            collect_skill_entries(&agent_dir.join("skills"), true),
+        );
+
+        if let Some(home_dir) = home {
+            add_top_level_catalog_group(
+                &mut builder,
+                CatalogResourceKind::Skills,
+                ResourceScope::Global,
+                ResourceOrigin::TopLevel {
+                    root: home_dir.join(".agents").join("skills"),
+                },
+                collect_skill_entries(&home_dir.join(".agents").join("skills"), true),
+            );
+        }
+
+        add_top_level_catalog_group(
+            &mut builder,
+            CatalogResourceKind::Skills,
+            ResourceScope::Project,
+            ResourceOrigin::TopLevel {
+                root: project_base.join("skills"),
+            },
+            collect_skill_entries(&project_base.join("skills"), true),
+        );
+
+        for ancestor_dir in collect_ancestor_agents_skill_dirs(cwd) {
+            add_top_level_catalog_group(
+                &mut builder,
+                CatalogResourceKind::Skills,
+                ResourceScope::Project,
+                ResourceOrigin::TopLevel {
+                    root: ancestor_dir.clone(),
+                },
+                collect_skill_entries(&ancestor_dir, true),
+            );
+        }
+    }
+
+    if !options.no_prompt_templates {
+        add_top_level_catalog_group(
+            &mut builder,
+            CatalogResourceKind::Prompts,
+            ResourceScope::Global,
+            ResourceOrigin::TopLevel {
+                root: agent_dir.join("prompts"),
+            },
+            collect_top_level_files(&agent_dir.join("prompts"), "md"),
+        );
+        add_top_level_catalog_group(
+            &mut builder,
+            CatalogResourceKind::Prompts,
+            ResourceScope::Project,
+            ResourceOrigin::TopLevel {
+                root: project_base.join("prompts"),
+            },
+            collect_top_level_files(&project_base.join("prompts"), "md"),
+        );
+    }
+
+    if !options.no_themes {
+        add_top_level_catalog_group(
+            &mut builder,
+            CatalogResourceKind::Themes,
+            ResourceScope::Global,
+            ResourceOrigin::TopLevel {
+                root: agent_dir.join("themes"),
+            },
+            collect_top_level_files(&agent_dir.join("themes"), "json"),
+        );
+        add_top_level_catalog_group(
+            &mut builder,
+            CatalogResourceKind::Themes,
+            ResourceScope::Project,
+            ResourceOrigin::TopLevel {
+                root: project_base.join("themes"),
+            },
+            collect_top_level_files(&project_base.join("themes"), "json"),
+        );
+    }
+
+    apply_settings_catalog_entries(
+        &mut builder,
+        CatalogResourceKind::Skills,
+        options.settings_manager.as_ref(),
+        SettingsScope::Global,
+        ResourceScope::Global,
+        agent_dir,
+        "skills",
+        true,
+    );
+    apply_settings_catalog_entries(
+        &mut builder,
+        CatalogResourceKind::Skills,
+        options.settings_manager.as_ref(),
+        SettingsScope::Project,
+        ResourceScope::Project,
+        &project_base,
+        "skills",
+        true,
+    );
+    apply_settings_catalog_entries(
+        &mut builder,
+        CatalogResourceKind::Prompts,
+        options.settings_manager.as_ref(),
+        SettingsScope::Global,
+        ResourceScope::Global,
+        agent_dir,
+        "prompts",
+        false,
+    );
+    apply_settings_catalog_entries(
+        &mut builder,
+        CatalogResourceKind::Prompts,
+        options.settings_manager.as_ref(),
+        SettingsScope::Project,
+        ResourceScope::Project,
+        &project_base,
+        "prompts",
+        false,
+    );
+    apply_settings_catalog_entries(
+        &mut builder,
+        CatalogResourceKind::Themes,
+        options.settings_manager.as_ref(),
+        SettingsScope::Global,
+        ResourceScope::Global,
+        agent_dir,
+        "themes",
+        false,
+    );
+    apply_settings_catalog_entries(
+        &mut builder,
+        CatalogResourceKind::Themes,
+        options.settings_manager.as_ref(),
+        SettingsScope::Project,
+        ResourceScope::Project,
+        &project_base,
+        "themes",
+        false,
+    );
+
+    for root in &options.package_roots {
+        if !options.no_skills {
+            add_package_catalog_group(
+                &mut builder,
+                CatalogResourceKind::Skills,
+                root.scope,
+                ResourceOrigin::Package {
+                    root: root.path.clone(),
+                },
+                collect_package_resource_catalog_entries(&root.path, "skills", true),
+            );
+        }
+
+        if !options.no_prompt_templates {
+            add_package_catalog_group(
+                &mut builder,
+                CatalogResourceKind::Prompts,
+                root.scope,
+                ResourceOrigin::Package {
+                    root: root.path.clone(),
+                },
+                collect_package_resource_catalog_entries(&root.path, "prompts", false),
+            );
+        }
+
+        if !options.no_themes {
+            add_package_catalog_group(
+                &mut builder,
+                CatalogResourceKind::Themes,
+                root.scope,
+                ResourceOrigin::Package {
+                    root: root.path.clone(),
+                },
+                collect_package_resource_catalog_entries(&root.path, "themes", false),
+            );
+        }
+    }
+
+    builder.finish()
+}
+
+fn apply_settings_catalog_entries(
+    builder: &mut ResourceCatalogBuilder,
+    kind: CatalogResourceKind,
+    settings_manager: Option<&SettingsManager>,
+    settings_scope: SettingsScope,
+    resource_scope: ResourceScope,
+    base_dir: &Path,
+    key: &str,
+    skill_mode: bool,
+) {
+    let Some(settings_manager) = settings_manager else {
+        return;
+    };
+    let Some(entries) = settings_manager.get_optional_string_list(key, Some(settings_scope)) else {
+        return;
+    };
+
+    let mut group_index = None;
+    for value in entries {
+        let (enabled, raw_entry) = if let Some(entry) = value.strip_prefix('-') {
+            (false, entry)
+        } else if let Some(entry) = value.strip_prefix('+') {
+            (true, entry)
+        } else {
+            (true, value.as_str())
+        };
+        let paths = collect_path_input_entries(base_dir, raw_entry, key, skill_mode);
+        if paths.is_empty() {
+            continue;
+        }
+
+        for path in paths {
+            if builder.set_entry_enabled(kind, resource_scope, &path, enabled) {
+                continue;
+            }
+
+            let index = *group_index.get_or_insert_with(|| {
+                builder.push_group(
+                    kind,
+                    resource_scope,
+                    ResourceOrigin::TopLevel {
+                        root: base_dir.join(key),
+                    },
+                )
+            });
+            builder.push_entry(kind, index, path, enabled);
+        }
+    }
+}
+
+fn add_top_level_catalog_group(
+    builder: &mut ResourceCatalogBuilder,
+    kind: CatalogResourceKind,
+    scope: ResourceScope,
+    origin: ResourceOrigin,
+    paths: Vec<PathBuf>,
+) {
+    if paths.is_empty() {
+        return;
+    }
+
+    let group_index = builder.push_group(kind, scope, origin);
+    for path in paths {
+        builder.push_entry(kind, group_index, path, true);
+    }
+}
+
+fn add_package_catalog_group(
+    builder: &mut ResourceCatalogBuilder,
+    kind: CatalogResourceKind,
+    scope: ResourceScope,
+    origin: ResourceOrigin,
+    entries: Vec<ResourceCatalogEntry>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let group_index = builder.push_group(kind, scope, origin);
+    for entry in entries {
+        builder.push_entry(kind, group_index, entry.path, entry.enabled);
+    }
+}
+
+fn collect_package_resource_catalog_entries(
+    package_root: &Path,
+    resource_dir_name: &str,
+    skill_mode: bool,
+) -> Vec<ResourceCatalogEntry> {
+    if let Some(manifest) = read_pi_manifest(package_root) {
+        let manifest_entries = match resource_dir_name {
+            "skills" => manifest.skills.as_deref(),
+            "prompts" => manifest.prompts.as_deref(),
+            "themes" => manifest.themes.as_deref(),
+            _ => None,
+        };
+        if let Some(entries) = manifest_entries {
+            return collect_manifest_resource_catalog_entries(
+                package_root,
+                resource_dir_name,
+                entries,
+                skill_mode,
+            );
+        }
+    }
+
+    collect_default_resource_catalog_entries(package_root, resource_dir_name, skill_mode)
+}
+
+fn collect_manifest_resource_catalog_entries(
+    package_root: &Path,
+    resource_dir_name: &str,
+    entries: &[String],
+    skill_mode: bool,
+) -> Vec<ResourceCatalogEntry> {
+    let base = package_root.join(resource_dir_name);
+    let mut candidates = if entries.is_empty() {
+        collect_default_resource_paths(&base, resource_dir_name, skill_mode)
+    } else {
+        let (plain, patterns) = split_patterns(entries);
+        let mut files = Vec::new();
+
+        if plain.is_empty() {
+            files = collect_default_resource_paths(&base, resource_dir_name, skill_mode);
+        } else {
+            for entry in plain {
+                files.extend(collect_manifest_entry_paths(
+                    package_root,
+                    resource_dir_name,
+                    &entry,
+                    skill_mode,
+                ));
+            }
+        }
+
+        files.sort();
+        files.dedup();
+
+        if patterns.is_empty() {
+            return files
+                .into_iter()
+                .map(|path| ResourceCatalogEntry {
+                    path,
+                    enabled: true,
+                })
+                .collect();
+        }
+
+        let enabled = apply_patterns(&files, &patterns, package_root);
+        return files
+            .into_iter()
+            .map(|path| ResourceCatalogEntry {
+                enabled: enabled.contains(&path),
+                path,
+            })
+            .collect();
+    };
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .map(|path| ResourceCatalogEntry {
+            path,
+            enabled: false,
+        })
+        .collect()
+}
+
+fn collect_default_resource_catalog_entries(
+    package_root: &Path,
+    resource_dir_name: &str,
+    skill_mode: bool,
+) -> Vec<ResourceCatalogEntry> {
+    collect_default_resource_paths(
+        &package_root.join(resource_dir_name),
+        resource_dir_name,
+        skill_mode,
+    )
+    .into_iter()
+    .map(|path| ResourceCatalogEntry {
+        path,
+        enabled: true,
+    })
+    .collect()
+}
+
+fn collect_default_resource_paths(
+    base: &Path,
+    resource_dir_name: &str,
+    skill_mode: bool,
+) -> Vec<PathBuf> {
+    if skill_mode {
+        collect_skill_entries(base, true)
+    } else if resource_dir_name == "themes" {
+        collect_top_level_files(base, "json")
+    } else {
+        collect_top_level_files(base, "md")
+    }
+}
+
 fn discover_resources_internal(
     cwd: &Path,
     agent_dir: &Path,
@@ -585,12 +1256,40 @@ fn add_settings_resource_paths(
             get_project_config_dir(cwd),
         ),
     ] {
-        let paths = settings_manager
-            .get_string_list(key, Some(settings_scope))
-            .into_iter()
-            .flat_map(|entry| collect_path_input_entries(&base_dir, &entry, key, skill_mode))
-            .collect::<Vec<_>>();
-        add_scoped_paths(target, seen, paths, resource_scope);
+        let entries = settings_manager
+            .get_optional_string_list(key, Some(settings_scope))
+            .unwrap_or_default();
+        for entry in entries {
+            let (enabled, raw_entry) = if let Some(value) = entry.strip_prefix('-') {
+                (false, value)
+            } else if let Some(value) = entry.strip_prefix('+') {
+                (true, value)
+            } else {
+                (true, entry.as_str())
+            };
+            let paths = collect_path_input_entries(&base_dir, raw_entry, key, skill_mode);
+            if enabled {
+                add_scoped_paths(target, seen, paths, resource_scope);
+            } else {
+                remove_scoped_paths(target, seen, &paths);
+            }
+        }
+    }
+}
+
+fn remove_scoped_paths(
+    target: &mut Vec<ScopedPath>,
+    seen: &mut HashMap<PathBuf, usize>,
+    paths: &[PathBuf],
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let remove = paths.iter().cloned().collect::<HashSet<_>>();
+    target.retain(|entry| !remove.contains(&entry.path));
+    seen.clear();
+    for (index, entry) in target.iter().enumerate() {
+        seen.insert(entry.path.clone(), index);
     }
 }
 
@@ -697,10 +1396,14 @@ fn discover_context_file_in_dir(dir: &Path) -> Option<PathBuf> {
 
 fn collect_ancestor_agents_skill_dirs(start_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    let workspace_root = find_workspace_root(start_dir);
     let mut current = start_dir.to_path_buf();
 
     loop {
         dirs.push(current.join(".agents").join("skills"));
+        if current == workspace_root {
+            break;
+        }
         let Some(parent) = current.parent() else {
             break;
         };
@@ -711,6 +1414,20 @@ fn collect_ancestor_agents_skill_dirs(start_dir: &Path) -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+fn find_workspace_root(start_dir: &Path) -> PathBuf {
+    let mut candidate = start_dir.to_path_buf();
+    let mut current = Some(start_dir);
+
+    while let Some(dir) = current {
+        if dir.join("Cargo.toml").exists() {
+            candidate = dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+
+    candidate
 }
 
 fn collect_package_resource_paths(
@@ -754,7 +1471,206 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
         pi: Option<PiManifest>,
     }
 
+    if !is_strict_json_object(&content) {
+        return None;
+    }
+
     serde_yaml::from_str::<PackageJson>(&content).ok()?.pi
+}
+
+fn is_strict_json_object(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut index = 0;
+
+    skip_json_whitespace(bytes, &mut index);
+    if parse_json_object(bytes, &mut index).is_none() {
+        return false;
+    }
+    skip_json_whitespace(bytes, &mut index);
+    index == bytes.len()
+}
+
+fn skip_json_whitespace(bytes: &[u8], index: &mut usize) {
+    while *index < bytes.len() {
+        match bytes[*index] {
+            b' ' | b'\n' | b'\r' | b'\t' => *index += 1,
+            _ => break,
+        }
+    }
+}
+
+fn parse_json_value(bytes: &[u8], index: &mut usize) -> Option<()> {
+    skip_json_whitespace(bytes, index);
+    let ch = *bytes.get(*index)?;
+    match ch {
+        b'{' => parse_json_object(bytes, index),
+        b'[' => parse_json_array(bytes, index),
+        b'"' => parse_json_string(bytes, index),
+        b'-' | b'0'..=b'9' => parse_json_number(bytes, index),
+        b't' => parse_json_literal(bytes, index, b"true"),
+        b'f' => parse_json_literal(bytes, index, b"false"),
+        b'n' => parse_json_literal(bytes, index, b"null"),
+        _ => None,
+    }
+}
+
+fn parse_json_object(bytes: &[u8], index: &mut usize) -> Option<()> {
+    if *bytes.get(*index)? != b'{' {
+        return None;
+    }
+    *index += 1;
+    skip_json_whitespace(bytes, index);
+
+    if matches!(bytes.get(*index), Some(b'}')) {
+        *index += 1;
+        return Some(());
+    }
+
+    loop {
+        parse_json_string(bytes, index)?;
+        skip_json_whitespace(bytes, index);
+        if *bytes.get(*index)? != b':' {
+            return None;
+        }
+        *index += 1;
+        parse_json_value(bytes, index)?;
+        skip_json_whitespace(bytes, index);
+        match bytes.get(*index) {
+            Some(b',') => {
+                *index += 1;
+                skip_json_whitespace(bytes, index);
+            }
+            Some(b'}') => {
+                *index += 1;
+                return Some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn parse_json_array(bytes: &[u8], index: &mut usize) -> Option<()> {
+    if *bytes.get(*index)? != b'[' {
+        return None;
+    }
+    *index += 1;
+    skip_json_whitespace(bytes, index);
+
+    if matches!(bytes.get(*index), Some(b']')) {
+        *index += 1;
+        return Some(());
+    }
+
+    loop {
+        parse_json_value(bytes, index)?;
+        skip_json_whitespace(bytes, index);
+        match bytes.get(*index) {
+            Some(b',') => {
+                *index += 1;
+                skip_json_whitespace(bytes, index);
+            }
+            Some(b']') => {
+                *index += 1;
+                return Some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn parse_json_string(bytes: &[u8], index: &mut usize) -> Option<()> {
+    if *bytes.get(*index)? != b'"' {
+        return None;
+    }
+    *index += 1;
+
+    while *index < bytes.len() {
+        match bytes[*index] {
+            b'"' => {
+                *index += 1;
+                return Some(());
+            }
+            b'\\' => {
+                *index += 1;
+                let escape = *bytes.get(*index)?;
+                match escape {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                        *index += 1;
+                    }
+                    b'u' => {
+                        *index += 1;
+                        for _ in 0..4 {
+                            let digit = *bytes.get(*index)?;
+                            if !digit.is_ascii_hexdigit() {
+                                return None;
+                            }
+                            *index += 1;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            0x00..=0x1F => return None,
+            _ => {
+                *index += 1;
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_json_number(bytes: &[u8], index: &mut usize) -> Option<()> {
+    if matches!(bytes.get(*index), Some(b'-')) {
+        *index += 1;
+    }
+
+    match bytes.get(*index)? {
+        b'0' => {
+            *index += 1;
+        }
+        b'1'..=b'9' => {
+            *index += 1;
+            while matches!(bytes.get(*index), Some(b'0'..=b'9')) {
+                *index += 1;
+            }
+        }
+        _ => return None,
+    }
+
+    if matches!(bytes.get(*index), Some(b'.')) {
+        *index += 1;
+        if !matches!(bytes.get(*index), Some(b'0'..=b'9')) {
+            return None;
+        }
+        while matches!(bytes.get(*index), Some(b'0'..=b'9')) {
+            *index += 1;
+        }
+    }
+
+    if matches!(bytes.get(*index), Some(b'e' | b'E')) {
+        *index += 1;
+        if matches!(bytes.get(*index), Some(b'+' | b'-')) {
+            *index += 1;
+        }
+        if !matches!(bytes.get(*index), Some(b'0'..=b'9')) {
+            return None;
+        }
+        while matches!(bytes.get(*index), Some(b'0'..=b'9')) {
+            *index += 1;
+        }
+    }
+
+    Some(())
+}
+
+fn parse_json_literal(bytes: &[u8], index: &mut usize, literal: &[u8]) -> Option<()> {
+    let end = *index + literal.len();
+    if bytes.get(*index..end)? != literal {
+        return None;
+    }
+    *index = end;
+    Some(())
 }
 
 fn collect_manifest_resource_entries(
@@ -1461,6 +2377,35 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn resource_kind_key(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Skills => "skills",
+        ResourceKind::Prompts => "prompts",
+        ResourceKind::Themes => "themes",
+    }
+}
+
+fn normalize_resource_entry(entry: &str) -> String {
+    let mut normalized = entry.trim().replace('\\', "/");
+    if let Some(rest) = normalized
+        .strip_prefix('+')
+        .or_else(|| normalized.strip_prefix('-'))
+    {
+        normalized = rest.to_string();
+    }
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    if normalized.starts_with('/') {
+        normalized = normalized[1..].to_string();
+    }
+    normalized
+}
+
+fn normalize_resource_entry_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use pi_rust_config::SettingsManager;
@@ -1475,113 +2420,75 @@ mod tests {
         fs::write(path, content).expect("write file");
     }
 
+    fn find_catalog_group<'a>(
+        groups: &'a [ResourceCatalogGroup],
+        scope: ResourceScope,
+        origin: ResourceOrigin,
+    ) -> &'a ResourceCatalogGroup {
+        groups
+            .iter()
+            .find(|group| group.scope == scope && group.origin == origin)
+            .expect("expected catalog group")
+    }
+
     #[test]
-    fn discovers_skills_prompts_and_themes_from_global_and_project_roots() {
+    fn catalog_groups_top_level_resources_by_scope_and_origin() {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("workspace").join("app");
         let agent_dir = tempdir.path().join("agent");
-        let fake_home = tempdir.path().join("home");
 
         write_file(&agent_dir.join("skills").join("global.md"), "global skill");
-        write_file(
-            &agent_dir.join("skills").join("nested").join("SKILL.md"),
-            "global nested skill",
-        );
-        write_file(
-            &agent_dir.join("prompts").join("global.md"),
-            "global prompt",
-        );
-        write_file(&agent_dir.join("themes").join("global.json"), "{}");
-
-        write_file(
-            &fake_home.join(".agents").join("skills").join("home.md"),
-            "home skill",
-        );
-
         write_file(
             &cwd.join(PROJECT_CONFIG_DIR_NAME)
                 .join("skills")
                 .join("project.md"),
             "project skill",
         );
-        write_file(
-            &cwd.join(PROJECT_CONFIG_DIR_NAME)
-                .join("skills")
-                .join("pkg")
-                .join("SKILL.md"),
-            "project package skill",
-        );
-        write_file(
-            &cwd.join(PROJECT_CONFIG_DIR_NAME)
-                .join("prompts")
-                .join("project.md"),
-            "project prompt",
-        );
-        write_file(
-            &cwd.join(PROJECT_CONFIG_DIR_NAME)
-                .join("themes")
-                .join("project.json"),
-            "{}",
-        );
-        write_file(
-            &cwd.join(".agents").join("skills").join("cwd-agent.md"),
-            "cwd agent skill",
-        );
 
-        let discovered = discover_resources_internal(&cwd, &agent_dir, Some(&fake_home));
-        let skill_paths = discovered
-            .skills
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect::<Vec<_>>();
-        let prompt_paths = discovered
-            .prompts
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect::<Vec<_>>();
-        let theme_paths = discovered
-            .themes
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect::<Vec<_>>();
+        let catalog = catalog_resources_with_options(&ResourceDiscoveryOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            settings_manager: None,
+            package_roots: Vec::new(),
+            explicit_skill_paths: Vec::new(),
+            explicit_prompt_paths: Vec::new(),
+            explicit_theme_paths: Vec::new(),
+            no_skills: false,
+            no_prompt_templates: false,
+            no_themes: false,
+        });
 
-        assert!(skill_paths.contains(&agent_dir.join("skills").join("global.md")));
-        assert!(skill_paths.contains(&agent_dir.join("skills").join("nested").join("SKILL.md")));
-        assert!(skill_paths.contains(&fake_home.join(".agents").join("skills").join("home.md")));
-        assert!(
-            skill_paths.contains(
-                &cwd.join(PROJECT_CONFIG_DIR_NAME)
-                    .join("skills")
-                    .join("project.md")
-            )
-        );
-        assert!(
-            skill_paths.contains(
-                &cwd.join(PROJECT_CONFIG_DIR_NAME)
-                    .join("skills")
-                    .join("pkg")
-                    .join("SKILL.md")
-            )
-        );
-        assert!(skill_paths.contains(&cwd.join(".agents").join("skills").join("cwd-agent.md")));
-
-        assert_eq!(
-            prompt_paths,
-            vec![
-                agent_dir.join("prompts").join("global.md"),
-                cwd.join(PROJECT_CONFIG_DIR_NAME)
-                    .join("prompts")
-                    .join("project.md")
-            ]
+        let global_group = find_catalog_group(
+            &catalog.skills,
+            ResourceScope::Global,
+            ResourceOrigin::TopLevel {
+                root: agent_dir.join("skills"),
+            },
         );
         assert_eq!(
-            theme_paths,
-            vec![
-                agent_dir.join("themes").join("global.json"),
-                cwd.join(PROJECT_CONFIG_DIR_NAME)
-                    .join("themes")
-                    .join("project.json")
-            ]
+            global_group.entries,
+            vec![ResourceCatalogEntry {
+                path: agent_dir.join("skills").join("global.md"),
+                enabled: true,
+            }]
+        );
+
+        let project_group = find_catalog_group(
+            &catalog.skills,
+            ResourceScope::Project,
+            ResourceOrigin::TopLevel {
+                root: cwd.join(PROJECT_CONFIG_DIR_NAME).join("skills"),
+            },
+        );
+        assert_eq!(
+            project_group.entries,
+            vec![ResourceCatalogEntry {
+                path: cwd
+                    .join(PROJECT_CONFIG_DIR_NAME)
+                    .join("skills")
+                    .join("project.md"),
+                enabled: true,
+            }]
         );
     }
 
@@ -1607,6 +2514,46 @@ mod tests {
                 cwd.join("AGENTS.md"),
             ]
         );
+    }
+
+    #[test]
+    fn ancestor_agents_skills_stop_at_workspace_root() {
+        let tempdir = tempdir().expect("tempdir");
+        let outer = tempdir.path().join("outer");
+        let root = outer.join("workspace");
+        let cwd = root.join("crate").join("app");
+        let agent_dir = tempdir.path().join("agent");
+
+        write_file(&root.join("Cargo.toml"), "[workspace]\n");
+        write_file(
+            &outer.join(".agents").join("skills").join("outer.md"),
+            "outer",
+        );
+        write_file(&root.join(".agents").join("skills").join("root.md"), "root");
+        write_file(&cwd.join(".agents").join("skills").join("cwd.md"), "cwd");
+
+        let discovered = discover_resources_with_options(&ResourceDiscoveryOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir),
+            settings_manager: None,
+            package_roots: Vec::new(),
+            explicit_skill_paths: Vec::new(),
+            explicit_prompt_paths: Vec::new(),
+            explicit_theme_paths: Vec::new(),
+            no_skills: false,
+            no_prompt_templates: false,
+            no_themes: false,
+        });
+
+        let skill_paths = discovered
+            .skills
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert!(skill_paths.contains(&cwd.join(".agents").join("skills").join("cwd.md")));
+        assert!(skill_paths.contains(&root.join(".agents").join("skills").join("root.md")));
+        assert!(!skill_paths.contains(&outer.join(".agents").join("skills").join("outer.md")));
     }
 
     #[test]
@@ -1728,6 +2675,169 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reports_package_patterns_and_empty_arrays() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("workspace");
+        let agent_dir = tempdir.path().join("agent");
+        let package_root = tempdir.path().join("package");
+
+        write_file(
+            &package_root.join("package.json"),
+            r#"{
+                "pi": {
+                    "skills": ["skills", "!skills/excluded.md", "+skills/forced.md", "-skills/disabled.md"],
+                    "prompts": ["prompts"],
+                    "themes": []
+                }
+            }"#,
+        );
+        write_file(&package_root.join("skills").join("keep.md"), "keep");
+        write_file(&package_root.join("skills").join("excluded.md"), "exclude");
+        write_file(&package_root.join("skills").join("forced.md"), "forced");
+        write_file(&package_root.join("skills").join("disabled.md"), "disabled");
+        write_file(&package_root.join("prompts").join("prompt.md"), "prompt");
+        write_file(&package_root.join("themes").join("theme.json"), "{}");
+
+        let options = ResourceDiscoveryOptions {
+            cwd,
+            agent_dir: Some(agent_dir),
+            settings_manager: None,
+            package_roots: vec![ScopedPath {
+                scope: ResourceScope::Project,
+                path: package_root.clone(),
+            }],
+            explicit_skill_paths: Vec::new(),
+            explicit_prompt_paths: Vec::new(),
+            explicit_theme_paths: Vec::new(),
+            no_skills: false,
+            no_prompt_templates: false,
+            no_themes: false,
+        };
+
+        let catalog = catalog_resources_with_options(&options);
+        let discovered = discover_resources_with_options(&options);
+
+        let skills_group = find_catalog_group(
+            &catalog.skills,
+            ResourceScope::Project,
+            ResourceOrigin::Package {
+                root: package_root.clone(),
+            },
+        );
+        assert_eq!(
+            skills_group.entries,
+            vec![
+                ResourceCatalogEntry {
+                    path: package_root.join("skills").join("disabled.md"),
+                    enabled: false,
+                },
+                ResourceCatalogEntry {
+                    path: package_root.join("skills").join("excluded.md"),
+                    enabled: false,
+                },
+                ResourceCatalogEntry {
+                    path: package_root.join("skills").join("forced.md"),
+                    enabled: true,
+                },
+                ResourceCatalogEntry {
+                    path: package_root.join("skills").join("keep.md"),
+                    enabled: true,
+                },
+            ]
+        );
+
+        let prompts_group = find_catalog_group(
+            &catalog.prompts,
+            ResourceScope::Project,
+            ResourceOrigin::Package {
+                root: package_root.clone(),
+            },
+        );
+        assert_eq!(
+            prompts_group.entries,
+            vec![ResourceCatalogEntry {
+                path: package_root.join("prompts").join("prompt.md"),
+                enabled: true,
+            }]
+        );
+
+        let themes_group = find_catalog_group(
+            &catalog.themes,
+            ResourceScope::Project,
+            ResourceOrigin::Package { root: package_root },
+        );
+        assert_eq!(
+            themes_group.entries,
+            vec![ResourceCatalogEntry {
+                path: tempdir
+                    .path()
+                    .join("package")
+                    .join("themes")
+                    .join("theme.json"),
+                enabled: false,
+            }]
+        );
+
+        let discovered_skill_paths = discovered
+            .skills
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            discovered_skill_paths.contains(
+                &tempdir
+                    .path()
+                    .join("package")
+                    .join("skills")
+                    .join("keep.md")
+            )
+        );
+        assert!(
+            discovered_skill_paths.contains(
+                &tempdir
+                    .path()
+                    .join("package")
+                    .join("skills")
+                    .join("forced.md")
+            )
+        );
+        assert!(
+            !discovered_skill_paths.contains(
+                &tempdir
+                    .path()
+                    .join("package")
+                    .join("skills")
+                    .join("excluded.md")
+            )
+        );
+        assert!(
+            !discovered_skill_paths.contains(
+                &tempdir
+                    .path()
+                    .join("package")
+                    .join("skills")
+                    .join("disabled.md")
+            )
+        );
+
+        assert_eq!(
+            discovered
+                .prompts
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                tempdir
+                    .path()
+                    .join("package")
+                    .join("prompts")
+                    .join("prompt.md")
+            ]
+        );
+        assert!(discovered.themes.is_empty());
+    }
+
+    #[test]
     fn package_manifest_filters_and_ignore_files_are_respected() {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("workspace");
@@ -1802,6 +2912,47 @@ mod tests {
     }
 
     #[test]
+    fn package_manifest_requires_strict_json_syntax() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("workspace");
+        let agent_dir = tempdir.path().join("agent");
+        let package_root = tempdir.path().join("package");
+
+        write_file(
+            &package_root.join("package.json"),
+            r#"
+pi:
+  skills: []
+"#,
+        );
+        write_file(&package_root.join("skills").join("keep.md"), "keep");
+
+        let discovered = discover_resources_with_options(&ResourceDiscoveryOptions {
+            cwd,
+            agent_dir: Some(agent_dir),
+            settings_manager: None,
+            package_roots: vec![ScopedPath {
+                scope: ResourceScope::Project,
+                path: package_root.clone(),
+            }],
+            explicit_skill_paths: Vec::new(),
+            explicit_prompt_paths: Vec::new(),
+            explicit_theme_paths: Vec::new(),
+            no_skills: false,
+            no_prompt_templates: false,
+            no_themes: false,
+        });
+
+        let skill_paths = discovered
+            .skills
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert!(skill_paths.contains(&package_root.join("skills").join("keep.md")));
+    }
+
+    #[test]
     fn empty_manifest_arrays_disable_resource_types() {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("workspace");
@@ -1838,6 +2989,88 @@ mod tests {
     }
 
     #[test]
+    fn toggle_scoped_resource_entry_writes_exact_prefixes() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("workspace");
+        let agent_dir = tempdir.path().join("agent");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let mut settings_manager = SettingsManager::create(&cwd, Some(agent_dir.clone()));
+        let entry = PathBuf::from("skills/global.md");
+
+        toggle_scoped_resource_entry(
+            &mut settings_manager,
+            SettingsScope::Global,
+            ResourceKind::Skills,
+            &entry,
+            false,
+        )
+        .expect("disable resource");
+        assert_eq!(
+            settings_manager.get_string_list("skills", Some(SettingsScope::Global)),
+            vec!["-skills/global.md".to_string()]
+        );
+
+        toggle_scoped_resource_entry(
+            &mut settings_manager,
+            SettingsScope::Global,
+            ResourceKind::Skills,
+            &entry,
+            true,
+        )
+        .expect("enable resource");
+        assert_eq!(
+            settings_manager.get_string_list("skills", Some(SettingsScope::Global)),
+            vec!["+skills/global.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn disable_model_invocation_skills_are_hidden_from_prompt_surface() {
+        let loaded = LoadedResources {
+            skills: vec![
+                LoadedTextResource {
+                    scope: ResourceScope::Project,
+                    path: PathBuf::from("visible.md"),
+                    content: r#"---
+name: Visible
+description: Visible skill
+---
+visible body
+"#
+                    .to_string(),
+                },
+                LoadedTextResource {
+                    scope: ResourceScope::Project,
+                    path: PathBuf::from("hidden.md"),
+                    content: r#"---
+name: Hidden
+description: Hidden skill
+disable-model-invocation: true
+---
+hidden body
+"#
+                    .to_string(),
+                },
+            ],
+            ..LoadedResources::default()
+        };
+
+        let parsed = parse_loaded_resources(&loaded);
+        assert_eq!(parsed.skills.len(), 2);
+        assert!(
+            parsed
+                .skills
+                .iter()
+                .any(|skill| skill.name == "Hidden" && skill.disable_model_invocation)
+        );
+
+        let prompt = format_skills_for_prompt(&parsed.skills);
+        assert!(prompt.contains("Visible"));
+        assert!(!prompt.contains("Hidden"));
+    }
+
+    #[test]
     fn project_scope_replaces_same_path_user_discovery() {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("workspace");
@@ -1847,8 +3080,8 @@ mod tests {
         write_file(&shared_root.join("skills").join("shared.md"), "shared");
 
         let discovered = discover_resources_with_options(&ResourceDiscoveryOptions {
-            cwd,
-            agent_dir: Some(agent_dir),
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
             settings_manager: None,
             package_roots: vec![
                 ScopedPath {
@@ -1857,7 +3090,7 @@ mod tests {
                 },
                 ScopedPath {
                     scope: ResourceScope::Project,
-                    path: shared_root,
+                    path: shared_root.clone(),
                 },
             ],
             explicit_skill_paths: Vec::new(),
@@ -1870,6 +3103,60 @@ mod tests {
 
         assert_eq!(discovered.skills.len(), 1);
         assert_eq!(discovered.skills[0].scope, ResourceScope::Project);
+
+        let catalog = catalog_resources_with_options(&ResourceDiscoveryOptions {
+            cwd,
+            agent_dir: Some(agent_dir),
+            settings_manager: None,
+            package_roots: vec![
+                ScopedPath {
+                    scope: ResourceScope::Global,
+                    path: shared_root.clone(),
+                },
+                ScopedPath {
+                    scope: ResourceScope::Project,
+                    path: shared_root.clone(),
+                },
+            ],
+            explicit_skill_paths: Vec::new(),
+            explicit_prompt_paths: Vec::new(),
+            explicit_theme_paths: Vec::new(),
+            no_skills: false,
+            no_prompt_templates: false,
+            no_themes: false,
+        });
+
+        let global_group = find_catalog_group(
+            &catalog.skills,
+            ResourceScope::Global,
+            ResourceOrigin::Package {
+                root: shared_root.clone(),
+            },
+        );
+        assert_eq!(
+            global_group.entries,
+            vec![ResourceCatalogEntry {
+                path: shared_root.join("skills").join("shared.md"),
+                enabled: false,
+            }]
+        );
+
+        let project_group = find_catalog_group(
+            &catalog.skills,
+            ResourceScope::Project,
+            ResourceOrigin::Package { root: shared_root },
+        );
+        assert_eq!(
+            project_group.entries,
+            vec![ResourceCatalogEntry {
+                path: tempdir
+                    .path()
+                    .join("shared")
+                    .join("skills")
+                    .join("shared.md"),
+                enabled: true,
+            }]
+        );
     }
 
     #[test]

@@ -98,6 +98,93 @@ pub struct RpcSessionStats {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RpcPluginRuntimePluginSummary {
+    pub descriptor_path: String,
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub manifest_version: u16,
+    pub command_count: usize,
+    pub tool_count: usize,
+    pub flag_count: usize,
+    pub hook_count: usize,
+    pub provider_count: usize,
+    pub model_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPluginRuntimeExecutableCapabilityCounts {
+    pub commands: usize,
+    pub tools: usize,
+    pub hooks: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPluginRuntimeCapabilityClasses {
+    pub executable: RpcPluginRuntimeExecutableCapabilityCounts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPluginRuntimeWarning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPluginRuntimeDiagnostics {
+    pub plugins: Vec<RpcPluginRuntimePluginSummary>,
+    pub warnings: Vec<RpcPluginRuntimeWarning>,
+}
+
+impl RpcPluginRuntimeDiagnostics {
+    pub fn with_capability_classes(&self) -> serde_json::Value {
+        let mut diagnostics = serde_json::to_value(self).expect("serialize diagnostics");
+        let Some(plugins) = diagnostics
+            .get_mut("plugins")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return diagnostics;
+        };
+
+        for (plugin_value, plugin_summary) in plugins.iter_mut().zip(self.plugins.iter()) {
+            let capability_classes =
+                serde_json::to_value(plugin_summary.capability_classes())
+                    .expect("serialize capability classes");
+            if let Some(plugin_object) = plugin_value.as_object_mut() {
+                plugin_object.insert("capabilityClasses".to_string(), capability_classes);
+            }
+        }
+
+        diagnostics
+    }
+}
+
+impl RpcPluginRuntimePluginSummary {
+    pub fn capability_classes(&self) -> RpcPluginRuntimeCapabilityClasses {
+        RpcPluginRuntimeCapabilityClasses {
+            executable: RpcPluginRuntimeExecutableCapabilityCounts {
+                commands: self.command_count,
+                tools: self.tool_count,
+                hooks: self.hook_count,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RpcTokenStats {
     pub input: u64,
     pub output: u64,
@@ -236,6 +323,11 @@ pub enum RpcCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    #[serde(alias = "get_plugin_diagnostics")]
+    GetPluginRuntimeDiagnostics {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     ExportHtml {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -305,7 +397,8 @@ impl RpcCommand {
             | Self::GetLastAssistantText { id }
             | Self::SetSessionName { id, .. }
             | Self::GetMessages { id }
-            | Self::GetCommands { id } => id.as_deref(),
+            | Self::GetCommands { id }
+            | Self::GetPluginRuntimeDiagnostics { id } => id.as_deref(),
         }
     }
 
@@ -339,6 +432,7 @@ impl RpcCommand {
             Self::SetSessionName { .. } => "set_session_name",
             Self::GetMessages { .. } => "get_messages",
             Self::GetCommands { .. } => "get_commands",
+            Self::GetPluginRuntimeDiagnostics { .. } => "get_plugin_runtime_diagnostics",
         }
     }
 }
@@ -536,7 +630,10 @@ pub enum RpcEvent {
 mod tests {
     use serde_json::json;
 
-    use super::{QueueMode, RpcCommand, RpcInbound, RpcResponse};
+    use super::{
+        QueueMode, RpcCommand, RpcInbound, RpcPluginRuntimeDiagnostics,
+        RpcPluginRuntimePluginSummary, RpcPluginRuntimeWarning, RpcResponse,
+    };
 
     #[test]
     fn parses_set_model_command_with_model_id() {
@@ -579,6 +676,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_plugin_runtime_diagnostics_command() {
+        let command: RpcCommand = serde_json::from_value(json!({
+            "type": "get_plugin_runtime_diagnostics",
+            "id": "diag-1"
+        }))
+        .expect("parse diagnostics command");
+
+        assert_eq!(command.command_name(), "get_plugin_runtime_diagnostics");
+        assert_eq!(command.id(), Some("diag-1"));
+    }
+
+    #[test]
+    fn parses_plugin_runtime_diagnostics_command_alias() {
+        let command: RpcCommand = serde_json::from_value(json!({
+            "type": "get_plugin_diagnostics",
+            "id": "diag-2"
+        }))
+        .expect("parse diagnostics command alias");
+
+        assert_eq!(command.command_name(), "get_plugin_runtime_diagnostics");
+        assert_eq!(command.id(), Some("diag-2"));
+    }
+
+    #[test]
     fn parses_camel_case_rpc_command_fields() {
         let command: RpcCommand = serde_json::from_value(json!({
             "type": "export_html",
@@ -596,6 +717,69 @@ mod tests {
         .expect("parse new session");
         assert!(
             matches!(command, RpcCommand::NewSession { parent_session, .. } if parent_session.as_deref() == Some("/tmp/session.jsonl"))
+        );
+    }
+
+    #[test]
+    fn serializes_plugin_runtime_diagnostics() {
+        let diagnostics = RpcPluginRuntimeDiagnostics {
+            plugins: vec![RpcPluginRuntimePluginSummary {
+                descriptor_path: "/tmp/plugin.json".to_string(),
+                plugin_id: "example".to_string(),
+                plugin_name: "Example Plugin".to_string(),
+                manifest_version: 1,
+                command_count: 1,
+                tool_count: 2,
+                flag_count: 0,
+                hook_count: 3,
+                provider_count: 0,
+                model_count: 0,
+            }],
+            warnings: vec![RpcPluginRuntimeWarning {
+                path: Some("/tmp/plugin.json".to_string()),
+                plugin_id: Some("example".to_string()),
+                plugin_name: Some("Example Plugin".to_string()),
+                event: Some("prompt_started".to_string()),
+                details: Some("prompt start".to_string()),
+                message: "hook dispatch is stubbed".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_value(diagnostics).expect("serialize diagnostics");
+        assert_eq!(json["plugins"][0]["pluginId"], json!("example"));
+        assert_eq!(json["warnings"][0]["event"], json!("prompt_started"));
+    }
+
+    #[test]
+    fn serializes_plugin_runtime_diagnostics_with_capability_classes() {
+        let diagnostics = RpcPluginRuntimeDiagnostics {
+            plugins: vec![RpcPluginRuntimePluginSummary {
+                descriptor_path: "/tmp/plugin.json".to_string(),
+                plugin_id: "example".to_string(),
+                plugin_name: "Example Plugin".to_string(),
+                manifest_version: 1,
+                command_count: 1,
+                tool_count: 2,
+                flag_count: 0,
+                hook_count: 3,
+                provider_count: 0,
+                model_count: 0,
+            }],
+            warnings: Vec::new(),
+        };
+
+        let json = diagnostics.with_capability_classes();
+        assert_eq!(
+            json["plugins"][0]["capabilityClasses"]["executable"]["commands"],
+            json!(1)
+        );
+        assert_eq!(
+            json["plugins"][0]["capabilityClasses"]["executable"]["tools"],
+            json!(2)
+        );
+        assert_eq!(
+            json["plugins"][0]["capabilityClasses"]["executable"]["hooks"],
+            json!(3)
         );
     }
 }

@@ -84,7 +84,6 @@ struct RenderedMessage {
     title: String,
     subtitle: String,
     preview: String,
-    search_text: String,
     html: String,
 }
 
@@ -173,7 +172,6 @@ fn build_rendered_message(index: usize, message: &Message) -> RenderedMessage {
                 title: "User".to_string(),
                 subtitle,
                 preview,
-                search_text,
                 html,
             }
         }
@@ -189,7 +187,6 @@ fn build_rendered_message(index: usize, message: &Message) -> RenderedMessage {
                     assistant.usage.total_tokens
                 ),
                 preview,
-                search_text,
                 html,
             }
         }
@@ -209,7 +206,6 @@ fn build_rendered_message(index: usize, message: &Message) -> RenderedMessage {
                     }
                 ),
                 preview,
-                search_text,
                 html,
             }
         }
@@ -716,19 +712,6 @@ fn render_filter_controls(stats: &SessionStats, messages: &[RenderedMessage]) ->
     }
     nav.push_str("</ol></section>");
     format!("{counts}{nav}")
-}
-
-fn render_navigation(messages: &[RenderedMessage]) -> String {
-    let mut html = String::new();
-    html.push_str("<div class=\"message-index\" aria-hidden=\"true\">");
-    for message in messages {
-        html.push_str(&format!(
-            "<a class=\"message-index-link\" href=\"#message-{}\" data-target=\"message-{}\">{}</a>",
-            message.index, message.index, message.index
-        ));
-    }
-    html.push_str("</div>");
-    html
 }
 
 fn render_stats_cards(stats: &SessionStats) -> String {

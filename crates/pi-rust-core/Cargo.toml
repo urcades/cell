@@ -13,6 +13,8 @@ pi-rust-config = { path = "../pi-rust-config" }
 pi-rust-models = { path = "../pi-rust-models" }
 pi-rust-oauth = { path = "../pi-rust-oauth" }
 pi-rust-packages = { path = "../pi-rust-packages" }
+pi-rust-plugin-host = { path = "../pi-rust-plugin-host" }
+pi-rust-plugins = { path = "../pi-rust-plugins" }
 pi-rust-protocol = { path = "../pi-rust-protocol" }
 pi-rust-resources = { path = "../pi-rust-resources" }
 pi-rust-session = { path = "../pi-rust-session" }
@@ -20,10 +22,12 @@ pi-rust-tools = { path = "../pi-rust-tools" }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 
 [dev-dependencies]
+pi-rust-plugins = { path = "../pi-rust-plugins" }
 tempfile.workspace = true

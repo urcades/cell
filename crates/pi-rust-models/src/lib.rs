@@ -6,10 +6,12 @@ use std::sync::Arc;
 use globset::GlobBuilder;
 use pi_rust_ai_core::{ApiId, Model, ModelCost, ModelInput, ProviderId};
 use pi_rust_config::get_models_path;
-use pi_rust_oauth::{AuthStorage, resolve_config_value, resolve_headers};
+use pi_rust_oauth::{AuthSource, AuthStorage, resolve_config_value, resolve_headers};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+mod generated_catalog;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopedModel {
@@ -30,6 +32,14 @@ pub struct ResolveCliModelResult {
     pub thinking_level: Option<String>,
     pub warning: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnownModelStatus {
+    pub model: Model,
+    pub authenticated: bool,
+    pub auth_source: AuthSource,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +235,29 @@ impl ModelRegistry {
             .iter()
             .filter(|model| self.auth_storage.has_auth(&model.provider.0))
             .cloned()
+            .collect()
+    }
+
+    pub fn known_models(&self) -> Vec<Model> {
+        self.get_all()
+    }
+
+    pub fn available_models(&self) -> Vec<Model> {
+        self.get_available()
+    }
+
+    pub fn known_models_with_auth(&self) -> Vec<KnownModelStatus> {
+        self.models
+            .iter()
+            .map(|model| {
+                let status = self.auth_storage.get_status(&model.provider.0);
+                KnownModelStatus {
+                    model: model.clone(),
+                    authenticated: status.authenticated,
+                    auth_source: status.source,
+                    available: status.authenticated,
+                }
+            })
             .collect()
     }
 
@@ -478,6 +511,22 @@ pub fn resolve_cli_model(
     cli_model: Option<&str>,
     model_registry: &ModelRegistry,
 ) -> ResolveCliModelResult {
+    resolve_cli_model_with_candidates(cli_provider, cli_model, model_registry.get_available())
+}
+
+pub fn resolve_known_cli_model(
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    model_registry: &ModelRegistry,
+) -> ResolveCliModelResult {
+    resolve_cli_model_with_candidates(cli_provider, cli_model, model_registry.get_all())
+}
+
+fn resolve_cli_model_with_candidates(
+    cli_provider: Option<&str>,
+    cli_model: Option<&str>,
+    available_models: Vec<Model>,
+) -> ResolveCliModelResult {
     let Some(cli_model) = cli_model else {
         return ResolveCliModelResult {
             model: None,
@@ -487,7 +536,6 @@ pub fn resolve_cli_model(
         };
     };
 
-    let available_models = model_registry.get_all();
     if available_models.is_empty() {
         return ResolveCliModelResult {
             model: None,
@@ -836,153 +884,10 @@ fn deep_merge_object(base: &mut Map<String, Value>, override_value: &Map<String,
 }
 
 fn built_in_models() -> Vec<Model> {
-    vec![
-        build_model(
-            "anthropic",
-            "anthropic-messages",
-            "claude-haiku-4-5",
-            "Claude Haiku 4.5",
-            true,
-            200_000,
-            8_192,
-        ),
-        build_model(
-            "anthropic",
-            "anthropic-messages",
-            "claude-sonnet-4-5",
-            "Claude Sonnet 4.5",
-            true,
-            200_000,
-            8_192,
-        ),
-        build_model(
-            "anthropic",
-            "anthropic-messages",
-            "claude-opus-4-6",
-            "Claude Opus 4.6",
-            true,
-            200_000,
-            8_192,
-        ),
-        build_model(
-            "openai",
-            "openai-responses",
-            "gpt-4.1",
-            "GPT-4.1",
-            true,
-            128_000,
-            16_384,
-        ),
-        build_model_with_spec(
-            "openai",
-            "openai-responses",
-            "gpt-5.1-codex",
-            "GPT-5.1 Codex",
-            true,
-            vec![ModelInput::Text, ModelInput::Image],
-            ModelCost {
-                input: 1.25,
-                output: 10.0,
-                cache_read: 0.125,
-                cache_write: 0.0,
-            },
-            400_000,
-            128_000,
-        ),
-        build_model(
-            "openai-codex",
-            "openai-codex-responses",
-            "gpt-5.3-codex",
-            "GPT-5.3 Codex",
-            true,
-            200_000,
-            32_768,
-        ),
-        build_model_with_spec(
-            "openrouter",
-            "openai-completions",
-            "openai/gpt-5.1-codex",
-            "OpenRouter GPT-5.1 Codex",
-            true,
-            vec![ModelInput::Text, ModelInput::Image],
-            ModelCost {
-                input: 1.25,
-                output: 10.0,
-                cache_read: 0.125,
-                cache_write: 0.0,
-            },
-            400_000,
-            128_000,
-        ),
-    ]
-}
-
-fn build_model(
-    provider: &str,
-    api: &str,
-    id: &str,
-    name: &str,
-    reasoning: bool,
-    context_window: u32,
-    max_tokens: u32,
-) -> Model {
-    build_model_with_spec(
-        provider,
-        api,
-        id,
-        name,
-        reasoning,
-        vec![ModelInput::Text],
-        zero_model_cost(),
-        context_window,
-        max_tokens,
-    )
-}
-
-fn build_model_with_spec(
-    provider: &str,
-    api: &str,
-    id: &str,
-    name: &str,
-    reasoning: bool,
-    input: Vec<ModelInput>,
-    cost: ModelCost,
-    context_window: u32,
-    max_tokens: u32,
-) -> Model {
-    Model {
-        id: id.to_string(),
-        name: name.to_string(),
-        api: ApiId::new(api),
-        provider: ProviderId::new(provider),
-        base_url: default_base_url(provider).to_string(),
-        reasoning,
-        input,
-        cost,
-        context_window,
-        max_tokens,
-        headers: None,
-        compat: None,
-    }
-}
-
-fn zero_model_cost() -> ModelCost {
-    ModelCost {
-        input: 0.0,
-        output: 0.0,
-        cache_read: 0.0,
-        cache_write: 0.0,
-    }
-}
-
-fn default_base_url(provider: &str) -> &'static str {
-    match provider {
-        "anthropic" => "https://api.anthropic.com",
-        "openai" => "https://api.openai.com/v1",
-        "openai-codex" => "https://chatgpt.com/backend-api",
-        "openrouter" => "https://openrouter.ai/api/v1",
-        _ => "https://example.com",
-    }
+    generated_catalog::built_in_model_specs()
+        .iter()
+        .map(|spec| spec.to_model())
+        .collect()
 }
 
 fn try_match_model(model_pattern: &str, available_models: &[Model]) -> Option<Model> {
@@ -1074,9 +979,10 @@ fn to_hash_map(headers: Option<&BTreeMap<String, String>>) -> HashMap<String, St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
-    use pi_rust_oauth::AuthStorage;
+    use pi_rust_oauth::{AuthCredential, AuthSource, AuthStorage, OAuthCredentials};
     use tempfile::tempdir;
 
     use super::{
@@ -1116,6 +1022,87 @@ mod tests {
             .find("anthropic", "claude-opus-4-6")
             .expect("anthropic model");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn known_and_available_model_views_are_distinct() {
+        let registry = ModelRegistry::new(AuthStorage::in_memory(Default::default()), None);
+
+        let known_models = registry.known_models();
+        let available_models = registry.available_models();
+
+        assert!(!known_models.is_empty());
+        assert!(available_models.is_empty());
+
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let registry = ModelRegistry::new(auth, None);
+        let known_models = registry.known_models();
+        let available_models = registry.available_models();
+
+        assert!(
+            known_models
+                .iter()
+                .any(|model| model.provider.0 == "anthropic")
+        );
+        assert!(
+            known_models
+                .iter()
+                .any(|model| model.provider.0 == "openai-codex")
+        );
+        assert!(
+            available_models
+                .iter()
+                .any(|model| model.provider.0 == "openai")
+        );
+        assert!(
+            !available_models
+                .iter()
+                .any(|model| model.provider.0 == "anthropic")
+        );
+        assert!(available_models.len() < known_models.len());
+    }
+
+    #[test]
+    fn known_model_status_reports_auth_source_and_availability() {
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        auth.set(
+            "openai-codex",
+            AuthCredential::OAuth(OAuthCredentials {
+                refresh: "refresh-token".to_string(),
+                access: "access-token".to_string(),
+                expires: i64::MAX,
+                extra: BTreeMap::new(),
+            }),
+        )
+        .expect("store oauth");
+        let registry = ModelRegistry::new(auth, None);
+
+        let known = registry.known_models_with_auth();
+        let openai = known
+            .iter()
+            .find(|status| status.model.provider.0 == "openai")
+            .expect("openai status");
+        assert_eq!(openai.auth_source, AuthSource::RuntimeOverride);
+        assert!(openai.authenticated);
+        assert!(openai.available);
+
+        let openai_codex = known
+            .iter()
+            .find(|status| status.model.provider.0 == "openai-codex")
+            .expect("openai-codex status");
+        assert_eq!(openai_codex.auth_source, AuthSource::StoredOAuth);
+        assert!(openai_codex.authenticated);
+        assert!(openai_codex.available);
+
+        let anthropic = known
+            .iter()
+            .find(|status| status.model.provider.0 == "anthropic")
+            .expect("anthropic status");
+        assert_eq!(anthropic.auth_source, AuthSource::Missing);
+        assert!(!anthropic.authenticated);
+        assert!(!anthropic.available);
     }
 
     #[test]
@@ -1199,7 +1186,9 @@ mod tests {
 
     #[test]
     fn resolve_cli_model_handles_provider_prefix_and_invalid_thinking_suffix() {
-        let registry = ModelRegistry::new(AuthStorage::in_memory(Default::default()), None);
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let registry = ModelRegistry::new(auth, None);
 
         let resolved = resolve_cli_model(None, Some("openai/gpt-5.1-codex"), &registry);
         assert_eq!(resolved.model.expect("resolved model").provider.0, "openai");
@@ -1210,6 +1199,17 @@ mod tests {
 
         let valid = resolve_cli_model(None, Some("gpt-5.1-codex:high"), &registry);
         assert_eq!(valid.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolve_cli_model_uses_available_models_only() {
+        let registry = ModelRegistry::new(AuthStorage::in_memory(Default::default()), None);
+        let resolved = resolve_cli_model(None, Some("gpt-5.1-codex"), &registry);
+        assert!(resolved.model.is_none());
+        assert_eq!(
+            resolved.error.as_deref(),
+            Some("No models available. Check your installation or add models to models.json.")
+        );
     }
 
     #[test]

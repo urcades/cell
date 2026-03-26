@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use pi_rust_ai_core::{
@@ -13,8 +14,11 @@ use pi_rust_config::{SettingsLoadError, SettingsManager, SettingsScope};
 use pi_rust_models::{
     ModelRegistry, ScopedModel, models_are_equal, resolve_model_scope, supports_xhigh,
 };
+use pi_rust_plugin_host::{ActivePluginRegistry, PluginHostWarning, PluginStartupSummary, RegisteredPluginSummary};
+use pi_rust_plugins::{LifecycleEventV1, LifecycleHookContextV1};
 use pi_rust_protocol::{
     QueueMode, RpcBashResult, RpcCommandLocation, RpcCommandSource, RpcEvent, RpcForkMessage,
+    RpcPluginRuntimeDiagnostics, RpcPluginRuntimePluginSummary, RpcPluginRuntimeWarning,
     RpcSessionState, RpcSessionStats, RpcSlashCommand, RpcTokenStats,
 };
 use pi_rust_resources::{
@@ -60,6 +64,7 @@ pub enum StartupResourceNoticeSection {
     Skill,
     Prompt,
     Theme,
+    Extension,
     Resource,
 }
 
@@ -70,6 +75,7 @@ impl StartupResourceNoticeSection {
             Self::Skill => "Skill conflicts",
             Self::Prompt => "Prompt conflicts",
             Self::Theme => "Theme conflicts",
+            Self::Extension => "Extension warnings",
             Self::Resource => "Resource issues",
         }
     }
@@ -88,6 +94,8 @@ pub struct StartupResourceSummary {
     pub skills: Vec<PathBuf>,
     pub prompts: Vec<PathBuf>,
     pub extensions: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_summaries: Vec<String>,
     pub themes: Vec<PathBuf>,
     pub conflicts: Vec<StartupResourceNotice>,
     pub notices: Vec<StartupResourceNotice>,
@@ -118,6 +126,11 @@ pub struct AgentSession {
     runtime_resource_config: Option<SessionRuntimeConfig>,
     runtime_resource_tool_names: Vec<String>,
     tool_set: ToolSet,
+    plugin_runtime: Option<Arc<Mutex<ActivePluginRegistry>>>,
+    plugin_runtime_summaries: Vec<RpcPluginRuntimePluginSummary>,
+    plugin_runtime_warnings: VecDeque<RpcPluginRuntimeWarning>,
+    session_started_notified: bool,
+    session_ended_notified: bool,
     scoped_models: Vec<ScopedModel>,
     prompt_templates: Vec<PromptTemplate>,
     skills: Vec<SkillDefinition>,
@@ -130,6 +143,29 @@ const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
+const PLUGIN_RUNTIME_WARNING_BUFFER_LIMIT: usize = 64;
+const BUILTIN_SLASH_COMMANDS: &[&str] = &[
+    "settings",
+    "model",
+    "scoped-models",
+    "export",
+    "share",
+    "copy",
+    "name",
+    "session",
+    "changelog",
+    "hotkeys",
+    "fork",
+    "tree",
+    "login",
+    "logout",
+    "new",
+    "compact",
+    "resume",
+    "reload",
+    "quit",
+    "exit",
+];
 
 impl AgentSession {
     pub fn new(
@@ -153,6 +189,11 @@ impl AgentSession {
             runtime_resource_config: None,
             runtime_resource_tool_names: Vec::new(),
             tool_set,
+            plugin_runtime: None,
+            plugin_runtime_summaries: Vec::new(),
+            plugin_runtime_warnings: VecDeque::new(),
+            session_started_notified: false,
+            session_ended_notified: false,
             scoped_models,
             prompt_templates,
             skills,
@@ -172,11 +213,26 @@ impl AgentSession {
         config: SessionRuntimeConfig,
         enabled_tool_names: Vec<String>,
         themes: Vec<LoadedTextResource>,
+        plugin_runtime: Option<Arc<Mutex<ActivePluginRegistry>>>,
+        plugin_startup_summary: PluginStartupSummary,
         startup_resource_summary: StartupResourceSummary,
     ) {
         self.runtime_resource_config = Some(config);
         self.runtime_resource_tool_names = enabled_tool_names;
         self.themes = themes;
+        self.plugin_runtime = plugin_runtime.clone();
+        if let Some(plugin_runtime) = plugin_runtime {
+            self.tool_set.attach_plugin_runtime(plugin_runtime);
+        }
+        self.seed_plugin_runtime_diagnostics(&plugin_startup_summary);
+        self.dispatch_lifecycle_hook_event(LifecycleEventV1::HostStartup, None);
+        for plugin_summary in self.plugin_runtime_summaries.clone() {
+            self.dispatch_lifecycle_hook_event(
+                LifecycleEventV1::PluginLoaded,
+                Some(format!("plugin_id={}", plugin_summary.plugin_id)),
+            );
+        }
+        self.record_session_start();
         self.startup_resource_summary = startup_resource_summary;
     }
 
@@ -311,6 +367,13 @@ impl AgentSession {
         &self.startup_resource_summary.notices
     }
 
+    pub fn get_plugin_runtime_diagnostics(&self) -> RpcPluginRuntimeDiagnostics {
+        RpcPluginRuntimeDiagnostics {
+            plugins: self.plugin_runtime_summaries.clone(),
+            warnings: self.plugin_runtime_warnings.iter().cloned().collect(),
+        }
+    }
+
     pub fn reload_runtime_resources(&mut self) -> Result<(), RuntimeError> {
         let config = self.runtime_resource_config.clone().ok_or_else(|| {
             RuntimeError::Message("Runtime resources are not configured.".to_string())
@@ -327,6 +390,17 @@ impl AgentSession {
         self.prompt_templates = resources.prompt_templates;
         self.skills = resources.skills;
         self.themes = resources.themes;
+        self.plugin_runtime = resources.plugin_runtime.clone();
+        if let Some(plugin_runtime) = resources.plugin_runtime {
+            self.tool_set.attach_plugin_runtime(plugin_runtime);
+        }
+        self.seed_plugin_runtime_diagnostics(&resources.plugin_startup_summary);
+        for plugin_summary in self.plugin_runtime_summaries.clone() {
+            self.dispatch_lifecycle_hook_event(
+                LifecycleEventV1::PluginLoaded,
+                Some(format!("plugin_id={}", plugin_summary.plugin_id)),
+            );
+        }
         self.startup_resource_summary = resources.startup_summary;
         Ok(())
     }
@@ -529,14 +603,12 @@ impl AgentSession {
                 Some(self.session.get_session_dir().to_path_buf()),
             )?,
         };
-        self.session = new_session;
-        self.restore_from_session_context();
+        self.transition_session(new_session);
         Ok(false)
     }
 
     pub fn switch_session(&mut self, session_path: &str) -> Result<bool, RuntimeError> {
-        self.session = SessionManager::open(session_path)?;
-        self.restore_from_session_context();
+        self.transition_session(SessionManager::open(session_path)?);
         Ok(false)
     }
 
@@ -546,9 +618,102 @@ impl AgentSession {
             .get_entry(entry_id)
             .and_then(extract_entry_text)
             .ok_or_else(|| RuntimeError::Message("Invalid entry ID for fork.".to_string()))?;
+        self.record_session_end();
         self.session.create_branched_session(entry_id)?;
         self.restore_from_session_context();
+        self.record_session_start();
         Ok((selected_text, false))
+    }
+
+    fn transition_session(&mut self, new_session: SessionManager) {
+        self.record_session_end();
+        self.session = new_session;
+        self.restore_from_session_context();
+        self.record_session_start();
+    }
+
+    fn record_session_start(&mut self) {
+        if self.session_started_notified && !self.session_ended_notified {
+            return;
+        }
+        self.dispatch_lifecycle_hook_event(
+            LifecycleEventV1::SessionStarted,
+            Some(format!("session_id={}", self.session.get_session_id())),
+        );
+        self.session_started_notified = true;
+        self.session_ended_notified = false;
+    }
+
+    fn record_session_end(&mut self) {
+        if !self.session_started_notified || self.session_ended_notified {
+            return;
+        }
+        self.dispatch_lifecycle_hook_event(
+            LifecycleEventV1::SessionEnded,
+            Some(format!("session_id={}", self.session.get_session_id())),
+        );
+        self.session_ended_notified = true;
+    }
+
+    fn seed_plugin_runtime_diagnostics(&mut self, startup_summary: &PluginStartupSummary) {
+        self.plugin_runtime_summaries = startup_summary
+            .summaries
+            .iter()
+            .map(plugin_runtime_summary_from_registered)
+            .collect();
+        self.plugin_runtime_warnings.clear();
+        for warning in &startup_summary.warnings {
+            self.push_plugin_runtime_warning(plugin_runtime_warning_from_host(warning));
+        }
+    }
+
+    fn dispatch_lifecycle_hook_event(
+        &mut self,
+        event: LifecycleEventV1,
+        details: Option<String>,
+    ) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let context = build_lifecycle_hook_context(
+            &event,
+            details.as_deref(),
+            self.session.get_cwd(),
+            Some(self.session.get_session_id()),
+            Some(&self.current_model().provider.0),
+            Some(&self.current_model().id),
+        );
+        let warnings = match plugin_runtime.lock() {
+            Ok(mut plugin_runtime) => plugin_runtime
+                .dispatch_hooks(context)
+                .warnings
+                .into_iter()
+                .map(|warning| {
+                    plugin_runtime_warning_from_host_event(&warning, &event, details.as_deref())
+                })
+                .collect(),
+            Err(_) => vec![RpcPluginRuntimeWarning {
+                path: None,
+                plugin_id: None,
+                plugin_name: None,
+                event: Some(lifecycle_event_name(&event).to_string()),
+                details,
+                message: format!(
+                    "Failed to lock plugin runtime while dispatching `{}` hooks.",
+                    lifecycle_event_name(&event)
+                ),
+            }],
+        };
+        for warning in warnings {
+            self.push_plugin_runtime_warning(warning);
+        }
+    }
+
+    fn push_plugin_runtime_warning(&mut self, warning: RpcPluginRuntimeWarning) {
+        while self.plugin_runtime_warnings.len() >= PLUGIN_RUNTIME_WARNING_BUFFER_LIMIT {
+            self.plugin_runtime_warnings.pop_front();
+        }
+        self.plugin_runtime_warnings.push_back(warning);
     }
 
     pub fn forkable_user_messages(&self) -> Vec<ForkableUserMessage> {
@@ -721,14 +886,20 @@ impl AgentSession {
 
     pub fn get_commands(&self) -> Vec<RpcSlashCommand> {
         let mut commands = Vec::new();
+        let mut seen = BUILTIN_SLASH_COMMANDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<HashSet<_>>();
         for template in &self.prompt_templates {
-            commands.push(RpcSlashCommand {
-                name: template.name.clone(),
-                description: Some(template.description.clone()),
-                source: RpcCommandSource::Prompt,
-                location: Some(location_for_scope(template.scope)),
-                path: Some(template.path.to_string_lossy().to_string()),
-            });
+            if seen.insert(template.name.clone()) {
+                commands.push(RpcSlashCommand {
+                    name: template.name.clone(),
+                    description: Some(template.description.clone()),
+                    source: RpcCommandSource::Prompt,
+                    location: Some(location_for_scope(template.scope)),
+                    path: Some(template.path.to_string_lossy().to_string()),
+                });
+            }
         }
         let skill_commands_enabled = self
             .settings_manager
@@ -736,13 +907,33 @@ impl AgentSession {
             .is_none_or(SettingsManager::get_enable_skill_commands);
         if skill_commands_enabled {
             for skill in &self.skills {
-                commands.push(RpcSlashCommand {
-                    name: format!("skill:{}", skill.name),
-                    description: Some(skill.description.clone()),
-                    source: RpcCommandSource::Skill,
-                    location: Some(location_for_scope(skill.scope)),
-                    path: Some(skill.path.to_string_lossy().to_string()),
-                });
+                let name = format!("skill:{}", skill.name);
+                if seen.insert(name.clone()) {
+                    commands.push(RpcSlashCommand {
+                        name,
+                        description: Some(skill.description.clone()),
+                        source: RpcCommandSource::Skill,
+                        location: Some(location_for_scope(skill.scope)),
+                        path: Some(skill.path.to_string_lossy().to_string()),
+                    });
+                }
+            }
+        }
+        if let Some(plugin_runtime) = &self.plugin_runtime {
+            if let Ok(plugin_runtime) = plugin_runtime.lock() {
+                for command in plugin_runtime.merged_registry().commands.values() {
+                    let name = command.registration.name.clone();
+                    if command.registration.hidden || !seen.insert(name.clone()) {
+                        continue;
+                    }
+                    commands.push(RpcSlashCommand {
+                        name,
+                        description: command.registration.description.clone(),
+                        source: RpcCommandSource::Extension,
+                        location: Some(RpcCommandLocation::Path),
+                        path: Some(command.source.descriptor_path.to_string_lossy().to_string()),
+                    });
+                }
             }
         }
         commands
@@ -928,6 +1119,7 @@ impl AgentSession {
         prompt: String,
     ) -> Result<PromptRun, RuntimeError> {
         let prompt = expand_prompt_template(&prompt, &self.prompt_templates);
+        let prompt = self.resolve_runtime_command_prompt(prompt)?;
         self.prompt_message_prepared(Message::User(UserMessage {
             content: UserContent::Text(prompt),
             timestamp: 0,
@@ -941,6 +1133,7 @@ impl AgentSession {
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<PromptRun, RuntimeError> {
         let prompt = expand_prompt_template(&prompt, &self.prompt_templates);
+        let prompt = self.resolve_runtime_command_prompt(prompt)?;
         self.prompt_message_prepared_internal(
             Message::User(UserMessage {
                 content: UserContent::Text(prompt),
@@ -949,6 +1142,67 @@ impl AgentSession {
             Some(event_tx),
         )
         .await
+    }
+
+    pub async fn prompt_text_as_blocks(
+        &mut self,
+        prompt: String,
+    ) -> Result<PromptRun, RuntimeError> {
+        let prompt = expand_prompt_template(&prompt, &self.prompt_templates);
+        let prompt = self.resolve_runtime_command_prompt(prompt)?;
+        self.prompt_message_prepared(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![UserContentBlock::Text {
+                text: prompt,
+                text_signature: None,
+            }]),
+            timestamp: 0,
+        }))
+        .await
+    }
+
+    fn resolve_runtime_command_prompt(&mut self, prompt: String) -> Result<String, RuntimeError> {
+        let Some(plugin_runtime) = self.plugin_runtime.as_ref().map(Arc::clone) else {
+            return Ok(prompt);
+        };
+        let Some(command_text) = prompt.strip_prefix('/') else {
+            return Ok(prompt);
+        };
+        let (command_name, args_text) = if let Some(index) = command_text.find(' ') {
+            (&command_text[..index], command_text[index + 1..].trim())
+        } else {
+            (command_text, "")
+        };
+        let plugin_runtime_guard = plugin_runtime
+            .lock()
+            .map_err(|_| RuntimeError::Message("Failed to lock plugin runtime.".to_string()))?;
+        if !plugin_runtime_guard
+            .merged_registry()
+            .commands
+            .contains_key(command_name)
+        {
+            return Ok(prompt);
+        }
+        let args = parse_runtime_command_args(args_text);
+        drop(plugin_runtime_guard);
+        self.dispatch_lifecycle_hook_event(
+            LifecycleEventV1::CommandStarted,
+            Some(format!("command_name={command_name}")),
+        );
+        let result = plugin_runtime
+            .lock()
+            .map_err(|_| RuntimeError::Message("Failed to lock plugin runtime.".to_string()))?
+            .invoke_command(
+                command_name,
+                &args,
+                self.tool_set.cwd(),
+                Some(&self.session.get_session_id().to_string()),
+                Some(&prompt),
+            );
+        self.dispatch_lifecycle_hook_event(
+            LifecycleEventV1::CommandFinished,
+            Some(format!("command_name={command_name}")),
+        );
+        result.map_err(|error| RuntimeError::Message(error.to_string()))
     }
 
     pub async fn prompt_message(&mut self, message: Message) -> Result<PromptRun, RuntimeError> {
@@ -968,6 +1222,10 @@ impl AgentSession {
         message: Message,
         event_tx: Option<mpsc::Sender<AgentEvent>>,
     ) -> Result<PromptRun, RuntimeError> {
+        self.dispatch_lifecycle_hook_event(
+            LifecycleEventV1::PromptStarted,
+            Some(format!("session_id={}", self.session.get_session_id())),
+        );
         let mut prompt_run = PromptRun {
             assistant_message: empty_assistant_message(self.current_model()),
             raw_events: Vec::new(),
@@ -1026,6 +1284,14 @@ impl AgentSession {
                         &event_tx,
                         AgentEvent::AgentEnd { messages },
                     );
+                    self.dispatch_lifecycle_hook_event(
+                        LifecycleEventV1::PromptFinished,
+                        Some(format!(
+                            "session_id={}; stop_reason={:?}",
+                            self.session.get_session_id(),
+                            assistant_message.stop_reason
+                        )),
+                    );
                     prompt_run.assistant_message = assistant_message;
                     return Ok(prompt_run);
                 }
@@ -1063,6 +1329,10 @@ impl AgentSession {
                             has_more_tool_calls = false;
                             break;
                         }
+                        self.dispatch_lifecycle_hook_event(
+                            LifecycleEventV1::ToolStarted,
+                            Some(format!("tool_call_id={tool_call_id}; tool_name={tool_name}")),
+                        );
                         let tool_result =
                             self.tool_set
                                 .execute(tool_call_id, tool_name, arguments.clone());
@@ -1094,6 +1364,13 @@ impl AgentSession {
                             AgentEvent::MessageEnd {
                                 message: tool_result_message,
                             },
+                        );
+                        self.dispatch_lifecycle_hook_event(
+                            LifecycleEventV1::ToolFinished,
+                            Some(format!(
+                                "tool_call_id={tool_call_id}; tool_name={tool_name}; is_error={}",
+                                tool_result.is_error
+                            )),
                         );
                         self.refresh_messages_from_session();
 
@@ -1184,6 +1461,14 @@ impl AgentSession {
             &mut prompt_run,
             &event_tx,
             AgentEvent::AgentEnd { messages },
+        );
+        self.dispatch_lifecycle_hook_event(
+            LifecycleEventV1::PromptFinished,
+            Some(format!(
+                "session_id={}; stop_reason={:?}",
+                self.session.get_session_id(),
+                assistant_message.stop_reason
+            )),
         );
         prompt_run.assistant_message = assistant_message;
         Ok(prompt_run)
@@ -1483,6 +1768,12 @@ impl AgentSession {
     }
 }
 
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        self.record_session_end();
+    }
+}
+
 fn map_reasoning_level(value: &str) -> Option<AiThinkingLevel> {
     match value {
         "minimal" => Some(AiThinkingLevel::Minimal),
@@ -1574,6 +1865,19 @@ fn scoped_model_to_pattern(scoped_model: &ScopedModel) -> String {
         .as_ref()
         .map(|thinking_level| format!("{base}:{thinking_level}"))
         .unwrap_or(base)
+}
+
+fn parse_runtime_command_args(args_text: &str) -> Vec<String> {
+    if args_text.is_empty() {
+        return Vec::new();
+    }
+
+    shlex::split(args_text).unwrap_or_else(|| {
+        args_text
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    })
 }
 
 fn extract_context_entry_text(entry: &Value) -> Option<String> {
@@ -1750,6 +2054,118 @@ fn location_for_scope(scope: pi_rust_resources::ResourceScope) -> RpcCommandLoca
     }
 }
 
+fn plugin_runtime_summary_from_registered(
+    summary: &RegisteredPluginSummary,
+) -> RpcPluginRuntimePluginSummary {
+    RpcPluginRuntimePluginSummary {
+        descriptor_path: summary.descriptor_path.to_string_lossy().to_string(),
+        plugin_id: summary.plugin_id.clone(),
+        plugin_name: summary.plugin_name.clone(),
+        manifest_version: summary.manifest_version,
+        command_count: summary.commands.len(),
+        tool_count: summary.tools.len(),
+        flag_count: summary.flags.len(),
+        hook_count: summary.hooks.len(),
+        provider_count: summary.providers.len(),
+        model_count: summary.models.len(),
+    }
+}
+
+fn plugin_runtime_warning_from_host(warning: &PluginHostWarning) -> RpcPluginRuntimeWarning {
+    RpcPluginRuntimeWarning {
+        path: Some(warning.path.to_string_lossy().to_string()),
+        plugin_id: warning.plugin_id.clone(),
+        plugin_name: warning.plugin_name.clone(),
+        event: None,
+        details: None,
+        message: warning.message.clone(),
+    }
+}
+
+fn plugin_runtime_warning_from_host_event(
+    warning: &PluginHostWarning,
+    event: &LifecycleEventV1,
+    details: Option<&str>,
+) -> RpcPluginRuntimeWarning {
+    RpcPluginRuntimeWarning {
+        path: Some(warning.path.to_string_lossy().to_string()),
+        plugin_id: warning.plugin_id.clone(),
+        plugin_name: warning.plugin_name.clone(),
+        event: Some(lifecycle_event_name(event).to_string()),
+        details: details.map(ToOwned::to_owned),
+        message: warning.message.clone(),
+    }
+}
+
+fn build_lifecycle_hook_context(
+    event: &LifecycleEventV1,
+    details: Option<&str>,
+    cwd: &Path,
+    session_id: Option<&str>,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+) -> LifecycleHookContextV1 {
+    let mut data = BTreeMap::new();
+    if let Some(details) = details {
+        data.insert("details".to_string(), Value::String(details.to_string()));
+        for segment in details.split(';') {
+            let Some((key, value)) = segment.trim().split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                continue;
+            }
+            data.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+
+    LifecycleHookContextV1 {
+        event: event.clone(),
+        plugin_id: lifecycle_subject_plugin_id(event, details),
+        workspace_root: Some(cwd.to_path_buf()),
+        session_id: session_id.map(ToOwned::to_owned),
+        provider_id: provider_id.map(ToOwned::to_owned),
+        model_id: model_id.map(ToOwned::to_owned),
+        data,
+    }
+}
+
+fn lifecycle_subject_plugin_id(event: &LifecycleEventV1, details: Option<&str>) -> String {
+    if matches!(event, LifecycleEventV1::PluginLoaded) {
+        if let Some(plugin_id) = details.and_then(|text| {
+            text.split(';').find_map(|segment| {
+                let (key, value) = segment.trim().split_once('=')?;
+                (key.trim() == "plugin_id").then(|| value.trim().to_string())
+            })
+        }) {
+            return plugin_id;
+        }
+    }
+    "pi-rust".to_string()
+}
+
+fn lifecycle_event_name(event: &LifecycleEventV1) -> &'static str {
+    match event {
+        LifecycleEventV1::PluginLoaded => "plugin_loaded",
+        LifecycleEventV1::PluginEnabled => "plugin_enabled",
+        LifecycleEventV1::PluginDisabled => "plugin_disabled",
+        LifecycleEventV1::HostStartup => "host_startup",
+        LifecycleEventV1::HostShutdown => "host_shutdown",
+        LifecycleEventV1::SessionStarted => "session_started",
+        LifecycleEventV1::SessionEnded => "session_ended",
+        LifecycleEventV1::PromptStarted => "prompt_started",
+        LifecycleEventV1::PromptFinished => "prompt_finished",
+        LifecycleEventV1::CommandStarted => "command_started",
+        LifecycleEventV1::CommandFinished => "command_finished",
+        LifecycleEventV1::ToolStarted => "tool_started",
+        LifecycleEventV1::ToolFinished => "tool_finished",
+        LifecycleEventV1::ProviderRegistered => "provider_registered",
+        LifecycleEventV1::ModelRegistered => "model_registered",
+    }
+}
+
 pub fn rpc_event_from_agent_event(event: AgentEvent) -> RpcEvent {
     match event {
         AgentEvent::AgentStart => RpcEvent::AgentStart,
@@ -1848,7 +2264,7 @@ pub fn build_scoped_models(
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
 
     use pi_rust_ai_core::{
         ApiId, AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, Message,
@@ -1859,7 +2275,13 @@ mod tests {
     use pi_rust_config::{ENV_AGENT_DIR, PROJECT_CONFIG_DIR_NAME, SettingsManager};
     use pi_rust_models::{ModelRegistry, ScopedModel};
     use pi_rust_oauth::AuthStorage;
-    use pi_rust_protocol::{OutputMode, RpcEvent};
+    use pi_rust_packages::{PackageInstallScope, PackageManager};
+    use pi_rust_plugins::{
+        CommandRegistrationV1, LifecycleEventV1, LifecycleHookRegistrationV1, ModelInputKindV1,
+        ModelRegistrationV1, PluginIdentityV1, PluginManifestV1, ProviderAuthV1,
+        ProviderRegistrationV1, ToolRegistrationV1, ValueKindV1,
+    };
+    use pi_rust_protocol::{OutputMode, RpcEvent, RpcPluginRuntimeDiagnostics};
     use pi_rust_session::SessionManager;
     use pi_rust_tools::ToolSet;
     use serde_json::json;
@@ -1868,7 +2290,8 @@ mod tests {
     use crate::{NonInteractiveRequest, create_agent_session};
 
     use super::{
-        AgentEvent, AgentSession, StartupResourceNoticeSection, rpc_event_from_agent_event,
+        AgentEvent, AgentSession, StartupResourceNoticeSection, StartupResourceSummary,
+        rpc_event_from_agent_event,
     };
 
     struct EchoProvider;
@@ -2192,9 +2615,94 @@ mod tests {
         }
     }
 
+    struct HookEchoProvider;
+
+    impl ApiProvider for HookEchoProvider {
+        fn api(&self) -> &'static str {
+            "openai-responses"
+        }
+
+        fn stream(
+            &self,
+            model: &Model,
+            context: &Context,
+            _options: Option<StreamOptions>,
+        ) -> pi_rust_ai_core::AssistantMessageEventStream {
+            let (mut sender, stream) = pi_rust_ai_core::AssistantMessageEventStream::new();
+            let prompt = match context.messages.last() {
+                Some(Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                })) => text.clone(),
+                _ => String::new(),
+            };
+            let assistant = if prompt == "call-plugin-tool" {
+                AssistantMessage {
+                    content: vec![AssistantContentBlock::ToolCall {
+                        id: "tool-1".to_string(),
+                        name: "plugin-write".to_string(),
+                        arguments: json!({"value":"tool"}),
+                        thought_signature: None,
+                    }],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    usage: Usage {
+                        input: 1,
+                        output: 1,
+                        cache_read: 0,
+                        cache_write: 0,
+                        total_tokens: 2,
+                        cost: UsageCost {
+                            input: "0".to_string(),
+                            output: "0".to_string(),
+                            cache_read: "0".to_string(),
+                            cache_write: "0".to_string(),
+                            total: "0".to_string(),
+                        },
+                    },
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 0,
+                }
+            } else {
+                AssistantMessage {
+                    content: vec![AssistantContentBlock::Text {
+                        text: prompt,
+                        text_signature: None,
+                    }],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    usage: Usage {
+                        input: 1,
+                        output: 1,
+                        cache_read: 0,
+                        cache_write: 0,
+                        total_tokens: 2,
+                        cost: UsageCost {
+                            input: "0".to_string(),
+                            output: "0".to_string(),
+                            cache_read: "0".to_string(),
+                            cache_write: "0".to_string(),
+                            total: "0".to_string(),
+                        },
+                    },
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 0,
+                }
+            };
+            sender.send(AssistantMessageEvent::Done {
+                reason: assistant.stop_reason,
+                message: assistant,
+            });
+            stream
+        }
+    }
+
     fn env_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
+        crate::test_env_guard()
     }
 
     fn write_file(path: &Path, content: &str) {
@@ -2202,6 +2710,235 @@ mod tests {
             fs::create_dir_all(parent).expect("create parent");
         }
         fs::write(path, content).expect("write file");
+    }
+
+    fn write_executable_script(path: &Path, content: &str) {
+        write_file(path, content);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).expect("script metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("mark script executable");
+        }
+    }
+
+    fn plugin_registration_json(
+        id: &str,
+        name: &str,
+        commands: &[&str],
+        tools: &[&str],
+        providers: &[&str],
+        models: &[&str],
+    ) -> String {
+        let mut manifest = PluginManifestV1::new(PluginIdentityV1 {
+            id: id.to_string(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: Some(format!("{name} plugin")),
+            authors: vec!["Acme".to_string()],
+            homepage: None,
+            repository: None,
+            license: Some("MIT".to_string()),
+        });
+
+        for command_name in commands {
+            manifest.commands.push(CommandRegistrationV1 {
+                name: (*command_name).to_string(),
+                description: Some(format!("Command {command_name}")),
+                aliases: Vec::new(),
+                parameters: Vec::new(),
+                hidden: false,
+            });
+        }
+
+        for tool_name in tools {
+            manifest.tools.push(ToolRegistrationV1 {
+                name: (*tool_name).to_string(),
+                description: Some(format!("Tool {tool_name}")),
+                aliases: Vec::new(),
+                parameters: Vec::new(),
+                output: Some(ValueKindV1::String),
+                hidden: false,
+            });
+        }
+
+        for provider_id in providers {
+            manifest.providers.push(ProviderRegistrationV1 {
+                provider_id: (*provider_id).to_string(),
+                name: format!("{provider_id} provider"),
+                api: format!("{provider_id}-chat"),
+                description: Some(format!("Provider {provider_id}")),
+                base_url: Some("https://example.invalid".to_string()),
+                headers: Default::default(),
+                auth: ProviderAuthV1::None,
+            });
+        }
+
+        for model_id in models {
+            manifest.models.push(ModelRegistrationV1 {
+                provider_id: providers.first().copied().unwrap_or(id).to_string(),
+                model_id: (*model_id).to_string(),
+                name: format!("{model_id} model"),
+                description: None,
+                input_modalities: vec![ModelInputKindV1::Text],
+                reasoning: false,
+                context_window: 4096,
+                max_output_tokens: 1024,
+                default: false,
+            });
+        }
+
+        serde_json::to_string(&pi_rust_plugin_host::PluginMessage::Registration {
+            protocol_version: pi_rust_plugin_host::HOST_PROTOCOL_VERSION_V1,
+            manifest,
+        })
+        .expect("serialize registration")
+    }
+
+    fn plugin_registration_json_with_hooks(
+        id: &str,
+        name: &str,
+        commands: &[&str],
+        tools: &[&str],
+        providers: &[&str],
+        models: &[&str],
+        hooks: &[(LifecycleEventV1, &str, i16)],
+    ) -> String {
+        let mut manifest = PluginManifestV1::new(PluginIdentityV1 {
+            id: id.to_string(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: Some(format!("{name} plugin")),
+            authors: vec!["Acme".to_string()],
+            homepage: None,
+            repository: None,
+            license: Some("MIT".to_string()),
+        });
+
+        for command_name in commands {
+            manifest.commands.push(CommandRegistrationV1 {
+                name: (*command_name).to_string(),
+                description: Some(format!("Command {command_name}")),
+                aliases: Vec::new(),
+                parameters: Vec::new(),
+                hidden: false,
+            });
+        }
+
+        for tool_name in tools {
+            manifest.tools.push(ToolRegistrationV1 {
+                name: (*tool_name).to_string(),
+                description: Some(format!("Tool {tool_name}")),
+                aliases: Vec::new(),
+                parameters: Vec::new(),
+                output: Some(ValueKindV1::String),
+                hidden: false,
+            });
+        }
+
+        for provider_id in providers {
+            manifest.providers.push(ProviderRegistrationV1 {
+                provider_id: (*provider_id).to_string(),
+                name: format!("{provider_id} provider"),
+                api: format!("{provider_id}-chat"),
+                description: Some(format!("Provider {provider_id}")),
+                base_url: Some("https://example.invalid".to_string()),
+                headers: Default::default(),
+                auth: ProviderAuthV1::None,
+            });
+        }
+
+        for model_id in models {
+            manifest.models.push(ModelRegistrationV1 {
+                provider_id: providers.first().copied().unwrap_or(id).to_string(),
+                model_id: (*model_id).to_string(),
+                name: format!("{model_id} model"),
+                description: None,
+                input_modalities: vec![ModelInputKindV1::Text],
+                reasoning: false,
+                context_window: 4096,
+                max_output_tokens: 1024,
+                default: false,
+            });
+        }
+
+        for (event, hook_name, priority) in hooks {
+            manifest.hooks.push(LifecycleHookRegistrationV1 {
+                event: event.clone(),
+                name: (*hook_name).to_string(),
+                description: Some(format!("Hook {hook_name}")),
+                priority: *priority,
+            });
+        }
+
+        serde_json::to_string(&pi_rust_plugin_host::PluginMessage::Registration {
+            protocol_version: pi_rust_plugin_host::HOST_PROTOCOL_VERSION_V1,
+            manifest,
+        })
+        .expect("serialize registration")
+    }
+
+    fn plugin_script(manifest_json: &str) -> String {
+        format!(
+            r#"#!/bin/sh
+set -eu
+read request
+case "$request" in
+  *'"type":"handshake_request"'* ) ;;
+  * ) echo "unexpected handshake" >&2; exit 42 ;;
+esac
+cat <<'JSON'
+{manifest_json}
+JSON
+"#
+        )
+    }
+
+    fn plugin_runtime_script(manifest_json: &str, handler_python: &str) -> String {
+        format!(
+            r#"#!/bin/sh
+set -eu
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp" <<'PY'
+import json, sys
+handshake = json.loads(sys.stdin.readline())
+if handshake.get("type") != "handshake_request":
+    sys.stderr.write("unexpected handshake\n")
+    sys.exit(42)
+print(r'''{manifest_json}''')
+sys.stdout.flush()
+{handler_python}
+PY
+python3 "$tmp"
+"#
+        )
+    }
+
+    fn plugin_descriptor_json(id: &str, name: &str) -> String {
+        serde_json::to_string_pretty(&pi_rust_plugin_host::PluginLaunchDescriptor {
+            id: id.to_string(),
+            name: name.to_string(),
+            executable: PathBuf::from("plugin.sh"),
+            args: Vec::new(),
+            working_directory: None,
+            env: Default::default(),
+            description: Some(format!("{name} plugin")),
+        })
+        .expect("serialize descriptor")
+    }
+
+    fn install_plugin_package(
+        package_manager: &mut PackageManager,
+        package_root: &Path,
+    ) -> Result<(), pi_rust_packages::PackageManagerError> {
+        package_manager.install(
+            &package_root.to_string_lossy(),
+            PackageInstallScope::Project,
+        )?;
+        Ok(())
     }
 
     fn model() -> Model {
@@ -2815,6 +3552,7 @@ mod tests {
             ]
         );
         assert_eq!(summary.extensions, Vec::<PathBuf>::new());
+        assert!(summary.extension_summaries.is_empty());
         assert_eq!(summary.themes, vec![missing_theme.clone()]);
         assert_eq!(
             summary.conflicts.len(),
@@ -2889,6 +3627,12 @@ mod tests {
             vec![project_context.clone()]
         );
         assert!(agent_session.startup_resource_summary().notices.is_empty());
+        assert!(
+            agent_session
+                .startup_resource_summary()
+                .extension_summaries
+                .is_empty()
+        );
 
         fs::remove_file(&project_context).expect("remove context file");
         fs::create_dir_all(&project_context).expect("create broken context dir");
@@ -2913,6 +3657,113 @@ mod tests {
             })
             .expect("context diagnostic");
         assert!(notice.message.contains("failed to read resource file"));
+    }
+
+    #[tokio::test]
+    async fn create_agent_session_records_startup_plugin_summaries_and_warnings() {
+        let _guard = env_guard().lock().expect("env guard");
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("workspace");
+        let agent_dir = tempdir.path().join("agent");
+        let good_root = tempdir.path().join("packages/good");
+        let malformed_root = tempdir.path().join("packages/malformed");
+        let good_descriptor = good_root.join(pi_rust_plugin_host::DISCOVERY_FILE_NAMES[0]);
+        let malformed_descriptor =
+            malformed_root.join(pi_rust_plugin_host::DISCOVERY_FILE_NAMES[0]);
+
+        write_executable_script(
+            &good_root.join("plugin.sh"),
+            &plugin_script(&plugin_registration_json(
+                "good",
+                "Good Plugin",
+                &["good-command"],
+                &["good-tool"],
+                &["good-provider"],
+                &["good-model"],
+            )),
+        );
+        write_file(
+            &good_descriptor,
+            &plugin_descriptor_json("good", "Good Plugin"),
+        );
+        write_file(&malformed_descriptor, "{ not json }\n");
+
+        let original_agent_dir = std::env::var_os(ENV_AGENT_DIR);
+        unsafe { std::env::set_var(ENV_AGENT_DIR, &agent_dir) };
+
+        let mut package_manager = PackageManager::create(&cwd, Some(agent_dir.clone()));
+        install_plugin_package(&mut package_manager, &good_root).expect("install good plugin");
+        install_plugin_package(&mut package_manager, &malformed_root)
+            .expect("install malformed plugin");
+
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(ContextEchoProvider));
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let mut models = ModelRegistry::new(auth, None);
+
+        let agent_session = create_agent_session(
+            &NonInteractiveRequest {
+                cwd: cwd.clone(),
+                mode: OutputMode::Text,
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5.1-codex".to_string()),
+                api_key: None,
+                system_prompt: None,
+                append_system_prompt: None,
+                initial_message: None,
+                messages: Vec::new(),
+                continue_session: false,
+                no_session: true,
+                session: None,
+                session_dir: None,
+                models: None,
+                no_tools: false,
+                tools: Some(vec!["read".to_string()]),
+                thinking: None,
+                no_skills: false,
+                skills: Vec::new(),
+                prompt_templates: Vec::new(),
+                no_prompt_templates: false,
+                themes: Vec::new(),
+                no_themes: false,
+            },
+            &providers,
+            &mut models,
+        )
+        .expect("create agent session");
+
+        match original_agent_dir {
+            Some(value) => unsafe { std::env::set_var(ENV_AGENT_DIR, value) },
+            None => unsafe { std::env::remove_var(ENV_AGENT_DIR) },
+        }
+
+        let summary = agent_session.startup_resource_summary();
+        assert_eq!(summary.extension_summaries.len(), 1);
+        assert!(
+            summary
+                .extension_summaries
+                .iter()
+                .any(|line| line.contains("Good Plugin [good]"))
+        );
+        assert_eq!(summary.extensions, vec![good_descriptor.clone()]);
+        assert!(summary.notices.iter().any(|notice| {
+            notice.section == StartupResourceNoticeSection::Extension
+                && notice.path == malformed_descriptor
+                && notice.message.contains("failed to parse plugin descriptor")
+        }));
+
+        let diagnostics: RpcPluginRuntimeDiagnostics =
+            agent_session.get_plugin_runtime_diagnostics();
+        assert_eq!(diagnostics.plugins.len(), 1);
+        assert_eq!(diagnostics.plugins[0].plugin_id, "good");
+        assert_eq!(diagnostics.warnings.len(), 1);
+        assert!(
+            diagnostics
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("failed to parse plugin descriptor"))
+        );
     }
 
     #[tokio::test]
@@ -3033,6 +3884,508 @@ mod tests {
                 text: "Review src/lib.rs".to_string(),
                 text_signature: None,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_runtime_resources_refreshes_startup_plugin_summaries_and_warnings() {
+        let _guard = env_guard().lock().expect("env guard");
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("workspace");
+        let agent_dir = tempdir.path().join("agent");
+        let good_root = tempdir.path().join("packages/good");
+        let fixed_root = tempdir.path().join("packages/fixed");
+        let good_descriptor = good_root.join(pi_rust_plugin_host::DISCOVERY_FILE_NAMES[0]);
+        let fixed_descriptor = fixed_root.join(pi_rust_plugin_host::DISCOVERY_FILE_NAMES[0]);
+
+        write_executable_script(
+            &good_root.join("plugin.sh"),
+            &plugin_script(&plugin_registration_json(
+                "good",
+                "Good Plugin",
+                &["good-command"],
+                &["good-tool"],
+                &["good-provider"],
+                &["good-model"],
+            )),
+        );
+        write_file(
+            &good_descriptor,
+            &plugin_descriptor_json("good", "Good Plugin"),
+        );
+        write_file(&fixed_descriptor, "{ not json }\n");
+
+        let original_agent_dir = std::env::var_os(ENV_AGENT_DIR);
+        unsafe { std::env::set_var(ENV_AGENT_DIR, &agent_dir) };
+
+        let mut package_manager = PackageManager::create(&cwd, Some(agent_dir.clone()));
+        install_plugin_package(&mut package_manager, &good_root).expect("install good plugin");
+        install_plugin_package(&mut package_manager, &fixed_root).expect("install fixed plugin");
+
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(ContextEchoProvider));
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let mut models = ModelRegistry::new(auth, None);
+
+        let mut agent_session = create_agent_session(
+            &NonInteractiveRequest {
+                cwd: cwd.clone(),
+                mode: OutputMode::Text,
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5.1-codex".to_string()),
+                api_key: None,
+                system_prompt: None,
+                append_system_prompt: None,
+                initial_message: None,
+                messages: Vec::new(),
+                continue_session: false,
+                no_session: true,
+                session: None,
+                session_dir: None,
+                models: None,
+                no_tools: false,
+                tools: Some(vec!["read".to_string()]),
+                thinking: None,
+                no_skills: false,
+                skills: Vec::new(),
+                prompt_templates: Vec::new(),
+                no_prompt_templates: false,
+                themes: Vec::new(),
+                no_themes: false,
+            },
+            &providers,
+            &mut models,
+        )
+        .expect("create agent session");
+
+        assert_eq!(
+            agent_session
+                .startup_resource_summary()
+                .extension_summaries
+                .len(),
+            1
+        );
+        assert!(agent_session.startup_resource_summary().notices.iter().any(
+            |notice| notice.section == StartupResourceNoticeSection::Extension
+                && notice.path == fixed_descriptor
+        ));
+
+        write_executable_script(
+            &fixed_root.join("plugin.sh"),
+            &plugin_script(&plugin_registration_json(
+                "fixed",
+                "Fixed Plugin",
+                &["fixed-command"],
+                &["fixed-tool"],
+                &["fixed-provider"],
+                &["fixed-model"],
+            )),
+        );
+        write_file(
+            &fixed_descriptor,
+            &plugin_descriptor_json("fixed", "Fixed Plugin"),
+        );
+
+        agent_session
+            .reload_runtime_resources()
+            .expect("reload runtime resources");
+
+        match original_agent_dir {
+            Some(value) => unsafe { std::env::set_var(ENV_AGENT_DIR, value) },
+            None => unsafe { std::env::remove_var(ENV_AGENT_DIR) },
+        }
+
+        let summary = agent_session.startup_resource_summary();
+        assert_eq!(summary.extension_summaries.len(), 2);
+        assert!(
+            summary
+                .extension_summaries
+                .iter()
+                .any(|line| line.contains("Good Plugin [good]"))
+        );
+        assert!(
+            summary
+                .extension_summaries
+                .iter()
+                .any(|line| line.contains("Fixed Plugin [fixed]"))
+        );
+        assert!(summary.notices.iter().all(|notice| {
+            !(notice.section == StartupResourceNoticeSection::Extension
+                && notice.path == fixed_descriptor
+                && notice.message.contains("failed to parse plugin descriptor"))
+        }));
+
+        let diagnostics: RpcPluginRuntimeDiagnostics =
+            agent_session.get_plugin_runtime_diagnostics();
+        assert_eq!(diagnostics.plugins.len(), 2);
+        assert!(diagnostics.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plugin_runtime_commands_appear_in_command_list_and_rewrite_prompt_text() {
+        let tempdir = tempdir().expect("tempdir");
+        let plugin_root = tempdir.path().join("packages/rewrite");
+        let descriptor_path = plugin_root.join("pi-plugin-host.json");
+        write_executable_script(
+            &plugin_root.join("plugin.sh"),
+            &plugin_runtime_script(
+                &plugin_registration_json("rewrite", "Rewrite Plugin", &["rewrite"], &[], &[], &[]),
+                r#"
+request = json.loads(sys.stdin.readline())
+assert request["type"] == "command_request"
+print(json.dumps({
+    "type": "command_response",
+    "requestId": request["requestId"],
+    "replacement": f"rewritten:{' '.join(request['args'])}",
+}), flush=True)
+"#,
+            ),
+        );
+        write_file(
+            &descriptor_path,
+            &plugin_descriptor_json("rewrite", "Rewrite Plugin"),
+        );
+
+        let host = pi_rust_plugin_host::PluginHost::new(pi_rust_plugin_host::PluginHostConfig {
+            discovery_roots: vec![plugin_root.clone()],
+            workspace_root: Some(tempdir.path().to_path_buf()),
+            handshake_timeout: std::time::Duration::from_millis(500),
+            host_identity: pi_rust_plugin_host::HostIdentity::new("pi-rust-plugin-host", "0.52.12"),
+        });
+        let runtime = host.discover_and_load_runtime_plugins();
+        assert!(
+            runtime.summary.warnings.is_empty(),
+            "warnings: {:#?}",
+            runtime.summary.warnings
+        );
+        let startup_summary = runtime.summary.clone();
+        let registry = runtime.registry.expect("runtime registry");
+
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(ContextEchoProvider));
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let models = ModelRegistry::new(auth, None);
+        let session = SessionManager::in_memory(tempdir.path());
+        let tools = ToolSet::new(tempdir.path());
+        let mut agent_session = AgentSession::new(
+            providers,
+            models,
+            session,
+            tools,
+            model(),
+            "off",
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        agent_session.attach_runtime_resources(
+            crate::runtime_resources::SessionRuntimeConfig {
+                cwd: tempdir.path().to_path_buf(),
+                system_prompt: None,
+                append_system_prompt: None,
+                explicit_skill_paths: Vec::new(),
+                explicit_prompt_paths: Vec::new(),
+                explicit_theme_paths: Vec::new(),
+                no_skills: false,
+                no_prompt_templates: false,
+                no_themes: false,
+            },
+            Vec::new(),
+            Vec::new(),
+            Some(Arc::new(Mutex::new(registry))),
+            startup_summary,
+            StartupResourceSummary::default(),
+        );
+
+        let commands = agent_session.get_commands();
+        assert!(commands.iter().any(|command| {
+            command.name == "rewrite"
+                && command.source == pi_rust_protocol::RpcCommandSource::Extension
+                && command.path.as_deref() == Some(descriptor_path.to_string_lossy().as_ref())
+        }));
+
+        let run = agent_session
+            .prompt_text("/rewrite alpha beta".to_string())
+            .await
+            .expect("prompt");
+        assert_eq!(
+            run.assistant_message.content,
+            vec![AssistantContentBlock::Text {
+                text: "rewritten:alpha beta".to_string(),
+                text_signature: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_runtime_commands_preserve_quoted_arguments() {
+        let tempdir = tempdir().expect("tempdir");
+        let plugin_root = tempdir.path().join("packages/rewrite");
+        let descriptor_path = plugin_root.join("pi-plugin-host.json");
+        write_executable_script(
+            &plugin_root.join("plugin.sh"),
+            &plugin_runtime_script(
+                &plugin_registration_json("rewrite", "Rewrite Plugin", &["rewrite"], &[], &[], &[]),
+                r#"
+request = json.loads(sys.stdin.readline())
+assert request["type"] == "command_request"
+print(json.dumps({
+    "type": "command_response",
+    "requestId": request["requestId"],
+    "replacement": f"rewritten:{'|'.join(request['args'])}",
+}), flush=True)
+"#,
+            ),
+        );
+        write_file(
+            &descriptor_path,
+            &plugin_descriptor_json("rewrite", "Rewrite Plugin"),
+        );
+
+        let host = pi_rust_plugin_host::PluginHost::new(pi_rust_plugin_host::PluginHostConfig {
+            discovery_roots: vec![plugin_root.clone()],
+            workspace_root: Some(tempdir.path().to_path_buf()),
+            handshake_timeout: std::time::Duration::from_millis(500),
+            host_identity: pi_rust_plugin_host::HostIdentity::new("pi-rust-plugin-host", "0.52.12"),
+        });
+        let runtime = host.discover_and_load_runtime_plugins();
+        assert!(
+            runtime.summary.warnings.is_empty(),
+            "warnings: {:#?}",
+            runtime.summary.warnings
+        );
+        let startup_summary = runtime.summary.clone();
+        let registry = runtime.registry.expect("runtime registry");
+
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(ContextEchoProvider));
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let models = ModelRegistry::new(auth, None);
+        let session = SessionManager::in_memory(tempdir.path());
+        let tools = ToolSet::new(tempdir.path());
+        let mut agent_session = AgentSession::new(
+            providers,
+            models,
+            session,
+            tools,
+            model(),
+            "off",
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        agent_session.attach_runtime_resources(
+            crate::runtime_resources::SessionRuntimeConfig {
+                cwd: tempdir.path().to_path_buf(),
+                system_prompt: None,
+                append_system_prompt: None,
+                explicit_skill_paths: Vec::new(),
+                explicit_prompt_paths: Vec::new(),
+                explicit_theme_paths: Vec::new(),
+                no_skills: false,
+                no_prompt_templates: false,
+                no_themes: false,
+            },
+            Vec::new(),
+            Vec::new(),
+            Some(Arc::new(Mutex::new(registry))),
+            startup_summary,
+            StartupResourceSummary::default(),
+        );
+
+        let run = agent_session
+            .prompt_text(r#"/rewrite "alpha beta" gamma"#.to_string())
+            .await
+            .expect("prompt");
+        assert_eq!(
+            run.assistant_message.content,
+            vec![AssistantContentBlock::Text {
+                text: "rewritten:alpha beta|gamma".to_string(),
+                text_signature: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_runtime_hook_warnings_cover_session_prompt_command_and_tool_events() {
+        let _guard = env_guard().lock().expect("env guard");
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().to_path_buf();
+        let plugin_root = cwd.join("packages/hooks");
+        let descriptor_path = plugin_root.join("pi-plugin-host.json");
+        let hook_log = cwd.join("hook-events.log");
+        let hook_handler = format!(
+            r#"
+hook_log = r'''{}'''
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    if request["type"] == "hook_request":
+        with open(hook_log, "a", encoding="utf-8") as handle:
+            handle.write(request["context"]["event"] + "\n")
+        print(json.dumps({{
+            "type": "hook_response",
+            "requestId": request["requestId"],
+            "outcome": "continue",
+        }}), flush=True)
+    elif request["type"] == "command_request":
+        print(json.dumps({{
+            "type": "command_response",
+            "requestId": request["requestId"],
+            "replacement": f"rewritten:{{' '.join(request['args'])}}",
+        }}), flush=True)
+    elif request["type"] == "tool_request":
+        print(json.dumps({{
+            "type": "tool_response",
+            "requestId": request["requestId"],
+            "content": [{{"type": "text", "text": f"tool:{{request['arguments']['value']}}"}}],
+            "details": {{"echo": request["arguments"]}},
+            "isError": False,
+        }}), flush=True)
+    else:
+        sys.stderr.write(f"unexpected request type: {{request['type']}}\n")
+        sys.exit(42)
+"#,
+            hook_log.display()
+        );
+        write_executable_script(
+            &plugin_root.join("plugin.sh"),
+            &plugin_runtime_script(
+                &plugin_registration_json_with_hooks(
+                    "hooks",
+                    "Hooks Plugin",
+                    &["rewrite"],
+                    &["plugin-write"],
+                    &[],
+                    &[],
+                    &[
+                        (LifecycleEventV1::HostStartup, "host-startup", 0),
+                        (LifecycleEventV1::PluginLoaded, "plugin-loaded", 0),
+                        (LifecycleEventV1::SessionStarted, "session-started", 0),
+                        (LifecycleEventV1::PromptStarted, "prompt-started", 0),
+                        (LifecycleEventV1::PromptFinished, "prompt-finished", 0),
+                        (LifecycleEventV1::CommandStarted, "command-started", 0),
+                        (LifecycleEventV1::CommandFinished, "command-finished", 0),
+                        (LifecycleEventV1::ToolStarted, "tool-started", 0),
+                        (LifecycleEventV1::ToolFinished, "tool-finished", 0),
+                        (LifecycleEventV1::SessionEnded, "session-ended", 0),
+                    ],
+                ),
+                &hook_handler,
+            ),
+        );
+        write_file(
+            &descriptor_path,
+            &plugin_descriptor_json("hooks", "Hooks Plugin"),
+        );
+
+        let agent_dir = tempdir.path().join("agent");
+        let original_agent_dir = std::env::var_os(ENV_AGENT_DIR);
+        unsafe { std::env::set_var(ENV_AGENT_DIR, &agent_dir) };
+        let mut package_manager = PackageManager::create(&cwd, Some(agent_dir.clone()));
+        install_plugin_package(&mut package_manager, &plugin_root).expect("install hooks plugin");
+
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(HookEchoProvider));
+        let mut auth = AuthStorage::in_memory(Default::default());
+        auth.set_runtime_api_key("openai", "runtime-key");
+        let mut models = ModelRegistry::new(auth, None);
+
+        let mut agent_session = create_agent_session(
+            &NonInteractiveRequest {
+                cwd: cwd.clone(),
+                mode: OutputMode::Text,
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5.1-codex".to_string()),
+                api_key: None,
+                system_prompt: None,
+                append_system_prompt: None,
+                initial_message: None,
+                messages: Vec::new(),
+                continue_session: false,
+                no_session: true,
+                session: None,
+                session_dir: None,
+                models: None,
+                no_tools: false,
+                tools: None,
+                thinking: None,
+                no_skills: false,
+                skills: Vec::new(),
+                prompt_templates: Vec::new(),
+                no_prompt_templates: false,
+                themes: Vec::new(),
+                no_themes: false,
+            },
+            &providers,
+            &mut models,
+        )
+        .expect("create agent session");
+
+        let diagnostics: RpcPluginRuntimeDiagnostics =
+            agent_session.get_plugin_runtime_diagnostics();
+        assert_eq!(diagnostics.plugins.len(), 1);
+        assert!(diagnostics.warnings.is_empty());
+
+        let rewrite_run = agent_session
+            .prompt_text("/rewrite alpha beta".to_string())
+            .await
+            .expect("rewrite prompt");
+        assert_eq!(
+            rewrite_run.assistant_message.content,
+            vec![AssistantContentBlock::Text {
+                text: "rewritten:alpha beta".to_string(),
+                text_signature: None,
+            }]
+        );
+
+        let diagnostics: RpcPluginRuntimeDiagnostics =
+            agent_session.get_plugin_runtime_diagnostics();
+        assert!(diagnostics.warnings.is_empty());
+
+        let tool_run = agent_session
+            .prompt_text("call-plugin-tool".to_string())
+            .await
+            .expect("tool prompt");
+        assert!(!tool_run.tool_results.is_empty());
+
+        let diagnostics: RpcPluginRuntimeDiagnostics =
+            agent_session.get_plugin_runtime_diagnostics();
+        assert!(diagnostics.warnings.is_empty());
+
+        drop(agent_session);
+        match original_agent_dir {
+            Some(value) => unsafe { std::env::set_var(ENV_AGENT_DIR, value) },
+            None => unsafe { std::env::remove_var(ENV_AGENT_DIR) },
+        }
+        let hook_events = std::fs::read_to_string(&hook_log)
+            .expect("read hook log")
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hook_events,
+            vec![
+                "hostStartup",
+                "pluginLoaded",
+                "sessionStarted",
+                "commandStarted",
+                "commandFinished",
+                "promptStarted",
+                "promptFinished",
+                "promptStarted",
+                "toolStarted",
+                "toolFinished",
+                "promptFinished",
+                "sessionEnded",
+            ]
         );
     }
 

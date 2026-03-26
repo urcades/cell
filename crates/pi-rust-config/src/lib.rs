@@ -1,9 +1,13 @@
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::Map;
+pub use serde_json::Value;
 use thiserror::Error;
 
 pub const APP_NAME: &str = "pi-rust";
@@ -74,6 +78,77 @@ pub enum SettingsScope {
     Project,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueModeSetting {
+    OneAtATime,
+    All,
+}
+
+impl QueueModeSetting {
+    fn as_str(self) -> &'static str {
+        match self {
+            QueueModeSetting::OneAtATime => "one-at-a-time",
+            QueueModeSetting::All => "all",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportSetting {
+    Sse,
+    Websocket,
+    Auto,
+}
+
+impl TransportSetting {
+    fn as_str(self) -> &'static str {
+        match self {
+            TransportSetting::Sse => "sse",
+            TransportSetting::Websocket => "websocket",
+            TransportSetting::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoubleEscapeActionSetting {
+    Tree,
+    Fork,
+    None,
+}
+
+impl DoubleEscapeActionSetting {
+    fn as_str(self) -> &'static str {
+        match self {
+            DoubleEscapeActionSetting::Tree => "tree",
+            DoubleEscapeActionSetting::Fork => "fork",
+            DoubleEscapeActionSetting::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GlobalSettingChange {
+    AutoCompact(bool),
+    SteeringMode(QueueModeSetting),
+    FollowUpMode(QueueModeSetting),
+    Transport(TransportSetting),
+    DefaultThinkingLevel(String),
+    Theme(String),
+    HideThinkingBlock(bool),
+    CollapseChangelog(bool),
+    QuietStartup(bool),
+    TerminalShowImages(bool),
+    ImagesAutoResize(bool),
+    ImagesBlockImages(bool),
+    EnableSkillCommands(bool),
+    ShowHardwareCursor(bool),
+    EditorPaddingX(i64),
+    AutocompleteMaxVisible(i64),
+    TerminalClearOnShrink(bool),
+    DoubleEscapeAction(DoubleEscapeActionSetting),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingsLayers {
     pub global: Value,
@@ -117,6 +192,8 @@ pub enum SettingsManagerError {
     InvalidRoot { path: PathBuf },
     #[error("failed to serialize settings: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("failed to acquire settings lock {path}: {message}")]
+    Lock { path: PathBuf, message: String },
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +291,95 @@ impl SettingsManager {
         self.update_scoped_settings(SettingsScope::Project, patch)
     }
 
+    pub fn apply_setting_change(
+        &mut self,
+        scope: SettingsScope,
+        change: GlobalSettingChange,
+    ) -> Result<(), SettingsManagerError> {
+        self.transact_scoped_settings(scope, |current| {
+            let object = current
+                .as_object_mut()
+                .expect("load_settings guarantees root object");
+            match change {
+                GlobalSettingChange::AutoCompact(enabled) => {
+                    set_path_value(object, &["compaction", "enabled"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::SteeringMode(mode) => {
+                    set_path_value(
+                        object,
+                        &["steeringMode"],
+                        Value::String(mode.as_str().to_string()),
+                    );
+                }
+                GlobalSettingChange::FollowUpMode(mode) => {
+                    set_path_value(
+                        object,
+                        &["followUpMode"],
+                        Value::String(mode.as_str().to_string()),
+                    );
+                }
+                GlobalSettingChange::Transport(transport) => {
+                    set_path_value(
+                        object,
+                        &["transport"],
+                        Value::String(transport.as_str().to_string()),
+                    );
+                }
+                GlobalSettingChange::DefaultThinkingLevel(level) => {
+                    set_path_value(object, &["defaultThinkingLevel"], Value::String(level));
+                }
+                GlobalSettingChange::Theme(theme) => {
+                    set_path_value(object, &["theme"], Value::String(theme));
+                }
+                GlobalSettingChange::HideThinkingBlock(enabled) => {
+                    set_path_value(object, &["hideThinkingBlock"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::CollapseChangelog(enabled) => {
+                    set_path_value(object, &["collapseChangelog"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::QuietStartup(enabled) => {
+                    set_path_value(object, &["quietStartup"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::TerminalShowImages(enabled) => {
+                    set_path_value(object, &["terminal", "showImages"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::ImagesAutoResize(enabled) => {
+                    set_path_value(object, &["images", "autoResize"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::ImagesBlockImages(enabled) => {
+                    set_path_value(object, &["images", "blockImages"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::EnableSkillCommands(enabled) => {
+                    set_path_value(object, &["enableSkillCommands"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::ShowHardwareCursor(enabled) => {
+                    set_path_value(object, &["showHardwareCursor"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::EditorPaddingX(padding) => {
+                    set_path_value(object, &["editorPaddingX"], Value::Number(padding.into()));
+                }
+                GlobalSettingChange::AutocompleteMaxVisible(max_visible) => {
+                    set_path_value(
+                        object,
+                        &["autocompleteMaxVisible"],
+                        Value::Number(max_visible.into()),
+                    );
+                }
+                GlobalSettingChange::TerminalClearOnShrink(enabled) => {
+                    set_path_value(object, &["terminal", "clearOnShrink"], Value::Bool(enabled));
+                }
+                GlobalSettingChange::DoubleEscapeAction(action) => {
+                    set_path_value(
+                        object,
+                        &["doubleEscapeAction"],
+                        Value::String(action.as_str().to_string()),
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn replace_global_settings(&mut self, settings: Value) -> Result<(), SettingsManagerError> {
         self.replace_scoped_settings(SettingsScope::Global, settings)
     }
@@ -231,6 +397,10 @@ impl SettingsManager {
             None => &self.layers.merged(),
         };
         extract_string_list(value.get(key))
+    }
+
+    pub fn get_plugin_roots(&self, scope: Option<SettingsScope>) -> Vec<String> {
+        self.get_string_list("pluginRoots", scope)
     }
 
     pub fn get_string(&self, key: &str, scope: Option<SettingsScope>) -> Option<String> {
@@ -282,15 +452,20 @@ impl SettingsManager {
         key: &str,
         values: &[String],
     ) -> Result<(), SettingsManagerError> {
-        let mut next = self.scoped_settings(scope).clone();
-        let object = next
-            .as_object_mut()
-            .expect("settings root must remain an object");
-        object.insert(
-            key.to_string(),
-            Value::Array(values.iter().cloned().map(Value::String).collect()),
-        );
-        self.replace_scoped_settings(scope, next)
+        self.mutate_scoped_settings(scope, |object| {
+            object.insert(
+                key.to_string(),
+                Value::Array(values.iter().cloned().map(Value::String).collect()),
+            );
+        })
+    }
+
+    pub fn set_plugin_roots(
+        &mut self,
+        scope: SettingsScope,
+        roots: &[String],
+    ) -> Result<(), SettingsManagerError> {
+        self.set_string_list(scope, "pluginRoots", roots)
     }
 
     pub fn set_optional_string_list(
@@ -299,11 +474,7 @@ impl SettingsManager {
         key: &str,
         values: Option<&[String]>,
     ) -> Result<(), SettingsManagerError> {
-        let mut next = self.scoped_settings(scope).clone();
-        let object = next
-            .as_object_mut()
-            .expect("settings root must remain an object");
-        match values {
+        self.mutate_scoped_settings(scope, |object| match values {
             Some(values) => {
                 object.insert(
                     key.to_string(),
@@ -313,8 +484,7 @@ impl SettingsManager {
             None => {
                 object.remove(key);
             }
-        }
-        self.replace_scoped_settings(scope, next)
+        })
     }
 
     pub fn get_default_provider(&self) -> Option<String> {
@@ -330,19 +500,16 @@ impl SettingsManager {
         provider: &str,
         model_id: &str,
     ) -> Result<(), SettingsManagerError> {
-        let mut next = self.scoped_settings(SettingsScope::Global).clone();
-        let object = next
-            .as_object_mut()
-            .expect("settings root must remain an object");
-        object.insert(
-            "defaultProvider".to_string(),
-            Value::String(provider.to_string()),
-        );
-        object.insert(
-            "defaultModel".to_string(),
-            Value::String(model_id.to_string()),
-        );
-        self.replace_scoped_settings(SettingsScope::Global, next)
+        self.mutate_scoped_settings(SettingsScope::Global, |object| {
+            object.insert(
+                "defaultProvider".to_string(),
+                Value::String(provider.to_string()),
+            );
+            object.insert(
+                "defaultModel".to_string(),
+                Value::String(model_id.to_string()),
+            );
+        })
     }
 
     pub fn get_enabled_models(&self, scope: Option<SettingsScope>) -> Option<Vec<String>> {
@@ -361,22 +528,31 @@ impl SettingsManager {
         self.get_bool("enableSkillCommands", None).unwrap_or(true)
     }
 
+    pub fn transact_scoped_settings<R>(
+        &mut self,
+        scope: SettingsScope,
+        mutate: impl FnOnce(&mut Value) -> Result<R, SettingsManagerError>,
+    ) -> Result<R, SettingsManagerError> {
+        let path = self.settings_path(scope).to_path_buf();
+        let _lock = SettingsFileLock::acquire(&path)?;
+        let mut current = load_settings(&path)?;
+        let result = mutate(&mut current)?;
+        ensure_object(&current, &path)?;
+        persist_settings_unlocked(&path, &current)?;
+        *self.scoped_settings_mut(scope) = current;
+        Ok(result)
+    }
+
     fn update_scoped_settings(
         &mut self,
         scope: SettingsScope,
         patch: Value,
     ) -> Result<(), SettingsManagerError> {
-        ensure_object(&patch, Path::new("<settings-patch>"))?;
-        match scope {
-            SettingsScope::Global => {
-                self.layers.global = deep_merge_settings(&self.layers.global, &patch);
-                persist_settings(&self.global_settings_path, &self.layers.global)
-            }
-            SettingsScope::Project => {
-                self.layers.project = deep_merge_settings(&self.layers.project, &patch);
-                persist_settings(&self.project_settings_path, &self.layers.project)
-            }
-        }
+        self.transact_scoped_settings(scope, |current| {
+            ensure_object(&patch, Path::new("<settings-patch>"))?;
+            *current = deep_merge_settings(current, &patch);
+            Ok(())
+        })
     }
 
     fn replace_scoped_settings(
@@ -384,16 +560,38 @@ impl SettingsManager {
         scope: SettingsScope,
         settings: Value,
     ) -> Result<(), SettingsManagerError> {
-        ensure_object(&settings, Path::new("<settings>"))?;
+        self.transact_scoped_settings(scope, |current| {
+            ensure_object(&settings, Path::new("<settings>"))?;
+            *current = settings;
+            Ok(())
+        })
+    }
+
+    fn mutate_scoped_settings(
+        &mut self,
+        scope: SettingsScope,
+        mutate: impl FnOnce(&mut Map<String, Value>),
+    ) -> Result<(), SettingsManagerError> {
+        self.transact_scoped_settings(scope, |current| {
+            let object = current
+                .as_object_mut()
+                .expect("load_settings guarantees root object");
+            mutate(object);
+            Ok(())
+        })
+    }
+
+    fn settings_path(&self, scope: SettingsScope) -> &Path {
         match scope {
-            SettingsScope::Global => {
-                self.layers.global = settings;
-                persist_settings(&self.global_settings_path, &self.layers.global)
-            }
-            SettingsScope::Project => {
-                self.layers.project = settings;
-                persist_settings(&self.project_settings_path, &self.layers.project)
-            }
+            SettingsScope::Global => &self.global_settings_path,
+            SettingsScope::Project => &self.project_settings_path,
+        }
+    }
+
+    fn scoped_settings_mut(&mut self, scope: SettingsScope) -> &mut Value {
+        match scope {
+            SettingsScope::Global => &mut self.layers.global,
+            SettingsScope::Project => &mut self.layers.project,
         }
     }
 }
@@ -496,7 +694,7 @@ fn load_settings(path: &Path) -> Result<Value, SettingsManagerError> {
     Ok(value)
 }
 
-fn persist_settings(path: &Path, value: &Value) -> Result<(), SettingsManagerError> {
+fn persist_settings_unlocked(path: &Path, value: &Value) -> Result<(), SettingsManagerError> {
     ensure_object(value, path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| SettingsManagerError::Io {
@@ -505,11 +703,74 @@ fn persist_settings(path: &Path, value: &Value) -> Result<(), SettingsManagerErr
         })?;
     }
     let payload = serde_json::to_string_pretty(value)?;
-    fs::write(path, payload).map_err(|source| SettingsManagerError::Io {
+    let temp_path = settings_temp_path(path);
+    fs::write(&temp_path, payload).map_err(|source| SettingsManagerError::Io {
+        path: temp_path.clone(),
+        source,
+    })?;
+    fs::rename(&temp_path, path).map_err(|source| SettingsManagerError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     Ok(())
+}
+
+fn settings_lock_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", path.display()))
+}
+
+fn settings_temp_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tmp", path.display()))
+}
+
+struct SettingsFileLock {
+    path: PathBuf,
+}
+
+impl SettingsFileLock {
+    fn acquire(path: &Path) -> Result<Self, SettingsManagerError> {
+        const LOCK_WAIT: Duration = Duration::from_millis(500);
+        const RETRY_DELAY: Duration = Duration::from_millis(10);
+
+        let lock_path = settings_lock_path(path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| SettingsManagerError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err(SettingsManagerError::Lock {
+                            path: lock_path,
+                            message: "timed out waiting for settings lock".to_string(),
+                        });
+                    }
+                    thread::sleep(RETRY_DELAY);
+                }
+                Err(error) => {
+                    return Err(SettingsManagerError::Lock {
+                        path: lock_path,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SettingsFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn ensure_object(value: &Value, path: &Path) -> Result<(), SettingsManagerError> {
@@ -538,6 +799,27 @@ fn merge_in_place(target: &mut Value, source: &Value) {
             *target_slot = source_value.clone();
         }
     }
+}
+
+fn set_path_value(object: &mut Map<String, Value>, path: &[&str], value: Value) {
+    let Some((head, tail)) = path.split_first() else {
+        return;
+    };
+    if tail.is_empty() {
+        object.insert((*head).to_string(), value);
+        return;
+    }
+
+    let entry = object
+        .entry((*head).to_string())
+        .or_insert_with(empty_settings);
+    if !entry.is_object() {
+        *entry = empty_settings();
+    }
+    let nested = entry
+        .as_object_mut()
+        .expect("set_path_value initializes nested object");
+    set_path_value(nested, tail, value);
 }
 
 fn empty_settings() -> Value {
@@ -711,6 +993,197 @@ mod tests {
     }
 
     #[test]
+    fn apply_setting_change_persists_all_interactive_overlay_settings() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        fs::write(
+            &global_path,
+            r#"{
+                "existing": 1,
+                "compaction": {"legacy": true},
+                "terminal": {"legacy": true},
+                "images": {"legacy": true}
+            }"#,
+        )
+        .expect("write global");
+
+        let mut manager = SettingsManager::from_paths(global_path.clone(), project_path);
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::AutoCompact(true),
+            )
+            .expect("auto compact");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::SteeringMode(QueueModeSetting::All),
+            )
+            .expect("steering mode");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::FollowUpMode(QueueModeSetting::OneAtATime),
+            )
+            .expect("follow-up mode");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::Transport(TransportSetting::Websocket),
+            )
+            .expect("transport");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::DefaultThinkingLevel("high".to_string()),
+            )
+            .expect("thinking level");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::Theme("midnight".to_string()),
+            )
+            .expect("theme");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::HideThinkingBlock(true),
+            )
+            .expect("hide thinking");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::CollapseChangelog(true),
+            )
+            .expect("collapse changelog");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::QuietStartup(true),
+            )
+            .expect("quiet startup");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::TerminalShowImages(false),
+            )
+            .expect("show images");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::ImagesAutoResize(false),
+            )
+            .expect("auto resize images");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::ImagesBlockImages(true),
+            )
+            .expect("block images");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::EnableSkillCommands(false),
+            )
+            .expect("skill commands");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::ShowHardwareCursor(true),
+            )
+            .expect("hardware cursor");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::EditorPaddingX(3),
+            )
+            .expect("editor padding");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::AutocompleteMaxVisible(15),
+            )
+            .expect("autocomplete visible");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::TerminalClearOnShrink(true),
+            )
+            .expect("clear on shrink");
+        manager
+            .apply_setting_change(
+                SettingsScope::Global,
+                GlobalSettingChange::DoubleEscapeAction(DoubleEscapeActionSetting::Fork),
+            )
+            .expect("double escape");
+
+        let persisted = read_json_file(&global_path);
+        assert_eq!(persisted["existing"], json!(1));
+        assert_eq!(persisted["compaction"]["legacy"], json!(true));
+        assert_eq!(persisted["compaction"]["enabled"], json!(true));
+        assert_eq!(persisted["steeringMode"], json!("all"));
+        assert_eq!(persisted["followUpMode"], json!("one-at-a-time"));
+        assert_eq!(persisted["transport"], json!("websocket"));
+        assert_eq!(persisted["defaultThinkingLevel"], json!("high"));
+        assert_eq!(persisted["theme"], json!("midnight"));
+        assert_eq!(persisted["hideThinkingBlock"], json!(true));
+        assert_eq!(persisted["collapseChangelog"], json!(true));
+        assert_eq!(persisted["quietStartup"], json!(true));
+        assert_eq!(persisted["terminal"]["legacy"], json!(true));
+        assert_eq!(persisted["terminal"]["showImages"], json!(false));
+        assert_eq!(persisted["terminal"]["clearOnShrink"], json!(true));
+        assert_eq!(persisted["images"]["legacy"], json!(true));
+        assert_eq!(persisted["images"]["autoResize"], json!(false));
+        assert_eq!(persisted["images"]["blockImages"], json!(true));
+        assert_eq!(persisted["enableSkillCommands"], json!(false));
+        assert_eq!(persisted["showHardwareCursor"], json!(true));
+        assert_eq!(persisted["editorPaddingX"], json!(3));
+        assert_eq!(persisted["autocompleteMaxVisible"], json!(15));
+        assert_eq!(persisted["doubleEscapeAction"], json!("fork"));
+    }
+
+    #[test]
+    fn apply_setting_change_can_target_project_scope() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        fs::write(&project_path, r#"{"theme":"project-light"}"#).expect("write project");
+
+        let mut manager = SettingsManager::from_paths(global_path, project_path.clone());
+        manager
+            .apply_setting_change(
+                SettingsScope::Project,
+                GlobalSettingChange::Theme("project-dark".to_string()),
+            )
+            .expect("update project theme");
+
+        let persisted = read_json_file(&project_path);
+        assert_eq!(persisted["theme"], json!("project-dark"));
+    }
+
+    #[test]
+    fn transaction_primitive_persists_and_returns_values() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        let mut manager = SettingsManager::from_paths(global_path.clone(), project_path);
+
+        let result = manager
+            .transact_scoped_settings(SettingsScope::Global, |current| {
+                let object = current
+                    .as_object_mut()
+                    .expect("load_settings guarantees root object");
+                object.insert("theme".to_string(), json!("dark"));
+                Ok("updated")
+            })
+            .expect("transaction");
+
+        assert_eq!(result, "updated");
+        assert_eq!(read_json_file(&global_path)["theme"], json!("dark"));
+    }
+
+    #[test]
     fn reload_collects_parse_errors_and_uses_empty_fallback() {
         let tempdir = tempdir().expect("tempdir");
         let global_path = tempdir.path().join("global.json");
@@ -767,6 +1240,47 @@ mod tests {
     }
 
     #[test]
+    fn gets_and_sets_plugin_roots_by_scope() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        fs::write(
+            &global_path,
+            r#"{"pluginRoots":["global-plugins"],"packages":["npm:chalk"]}"#,
+        )
+        .expect("write global");
+        fs::write(&project_path, r#"{"pluginRoots":["project-plugins"]}"#)
+            .expect("write project");
+
+        let mut manager = SettingsManager::from_paths(global_path.clone(), project_path.clone());
+        assert_eq!(
+            manager.get_plugin_roots(Some(SettingsScope::Global)),
+            vec!["global-plugins".to_string()]
+        );
+        assert_eq!(
+            manager.get_plugin_roots(Some(SettingsScope::Project)),
+            vec!["project-plugins".to_string()]
+        );
+        assert_eq!(
+            manager.get_plugin_roots(None),
+            vec!["project-plugins".to_string()]
+        );
+
+        manager
+            .set_plugin_roots(
+                SettingsScope::Project,
+                &["plugins/custom".to_string(), "../plugins/extra".to_string()],
+            )
+            .expect("set project plugin roots");
+
+        let persisted = read_json_file(&project_path);
+        assert_eq!(
+            persisted["pluginRoots"],
+            json!(["plugins/custom", "../plugins/extra"])
+        );
+    }
+
+    #[test]
     fn preserves_optional_enabled_models_presence() {
         let tempdir = tempdir().expect("tempdir");
         let global_path = tempdir.path().join("global.json");
@@ -819,5 +1333,86 @@ mod tests {
         let persisted = read_json_file(&global_path);
         assert_eq!(persisted["defaultProvider"], json!("openai"));
         assert_eq!(persisted["defaultModel"], json!("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn concurrent_patch_updates_merge_against_latest_file_state() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        fs::write(
+            &global_path,
+            r#"{"theme":"light","terminal":{"showImages":true}}"#,
+        )
+        .expect("write global");
+
+        let mut first = SettingsManager::from_paths(global_path.clone(), project_path.clone());
+        let mut second = SettingsManager::from_paths(global_path.clone(), project_path);
+
+        first
+            .update_global_settings(json!({"terminal":{"clearOnShrink":true}}))
+            .expect("first patch");
+        second
+            .update_global_settings(json!({"theme":"dark"}))
+            .expect("second patch");
+
+        let persisted = read_json_file(&global_path);
+        assert_eq!(persisted["theme"], json!("dark"));
+        assert_eq!(persisted["terminal"]["showImages"], json!(true));
+        assert_eq!(persisted["terminal"]["clearOnShrink"], json!(true));
+    }
+
+    #[test]
+    fn set_default_model_merges_against_latest_file_state() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        fs::write(
+            &global_path,
+            r#"{"theme":"light","terminal":{"showImages":true}}"#,
+        )
+        .expect("write global");
+
+        let mut first = SettingsManager::from_paths(global_path.clone(), project_path.clone());
+        let mut second = SettingsManager::from_paths(global_path.clone(), project_path);
+
+        first
+            .update_global_settings(json!({"terminal":{"clearOnShrink":true}}))
+            .expect("first patch");
+        second
+            .set_default_model_and_provider("openai", "gpt-5.1-codex")
+            .expect("set model");
+
+        let persisted = read_json_file(&global_path);
+        assert_eq!(persisted["theme"], json!("light"));
+        assert_eq!(persisted["terminal"]["showImages"], json!(true));
+        assert_eq!(persisted["terminal"]["clearOnShrink"], json!(true));
+        assert_eq!(persisted["defaultProvider"], json!("openai"));
+        assert_eq!(persisted["defaultModel"], json!("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn update_scoped_settings_times_out_when_lock_is_held() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.json");
+        let project_path = tempdir.path().join("project.json");
+        let lock_path = settings_lock_path(&global_path);
+        fs::write(&global_path, r#"{"theme":"light"}"#).expect("write global");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .expect("create lock");
+
+        let mut manager = SettingsManager::from_paths(global_path, project_path);
+        let error = manager
+            .update_global_settings(json!({"theme":"dark"}))
+            .expect_err("lock should block update");
+        match error {
+            SettingsManagerError::Lock { path, .. } => assert_eq!(path, lock_path),
+            other => panic!("unexpected error: {other}"),
+        }
+
+        fs::remove_file(lock_path).expect("cleanup lock");
     }
 }

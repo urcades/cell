@@ -1,0 +1,10 @@
+{
+  "id": "hello-plugin",
+  "name": "Hello Plugin",
+  "executable": "/usr/bin/env",
+  "args": ["cargo", "run", "--quiet", "--manifest-path", "./Cargo.toml"],
+  "env": {
+    "CARGO_TARGET_DIR": "./target/plugin-hello"
+  },
+  "description": "Minimal standalone Rust plugin example"
+}

@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 pi-rust-ai-core = { path = "../pi-rust-ai-core" }
+pi-rust-plugin-host = { path = "../pi-rust-plugin-host" }
+pi-rust-plugins = { path = "../pi-rust-plugins" }
 globset.workspace = true
 regex.workspace = true
 serde.workspace = true

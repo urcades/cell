@@ -1,0 +1,22 @@
+[package]
+name = "pi-rust-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pi-rust-ai-core = { path = "../pi-rust-ai-core" }
+pi-rust-core = { path = "../pi-rust-core" }
+pi-rust-jsonline-transport = { path = "../pi-rust-jsonline-transport" }
+pi-rust-protocol = { path = "../pi-rust-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+pi-rust-ai-providers = { path = "../pi-rust-ai-providers" }
+pi-rust-models = { path = "../pi-rust-models" }
+pi-rust-oauth = { path = "../pi-rust-oauth" }
+tempfile.workspace = true

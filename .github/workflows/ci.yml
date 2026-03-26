@@ -11,4 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: scripts/rust_only_ci.sh
+      - run: scripts/package_rust_repo.sh --output "$RUNNER_TEMP/pi-rust.tar.gz"
+      - name: Verify package checksum
+        run: sha256sum -c "$RUNNER_TEMP/pi-rust.tar.gz.sha256"

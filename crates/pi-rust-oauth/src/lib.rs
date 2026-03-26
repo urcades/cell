@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -13,8 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use pi_rust_config::get_auth_path;
+use reqwest::Client;
 use reqwest::Url;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -683,95 +684,131 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-fn blocking_client() -> Result<Client, String> {
+fn http_client() -> Result<Client, String> {
     Client::builder().build().map_err(|error| error.to_string())
 }
 
+fn run_async_http<Fut, T>(future: Fut) -> Result<T, String>
+where
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("pi-rust-oauth-http".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Failed to start OAuth runtime: {error}"))
+                .and_then(|runtime| runtime.block_on(future));
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("Failed to spawn OAuth runtime thread: {error}"))?;
+
+    receiver
+        .recv()
+        .map_err(|_| "OAuth runtime thread terminated unexpectedly.".to_string())?
+}
+
 fn exchange_openai_codex_code(code: &str, verifier: &str) -> Result<OAuthCredentials, String> {
-    let response = blocking_client()?
-        .post(OPENAI_CODEX_TOKEN_URL)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
+    let client = http_client()?;
+    let code = code.to_string();
+    let verifier = verifier.to_string();
+    run_async_http(async move {
+        let params = [
+            ("grant_type", "authorization_code".to_string()),
+            ("client_id", OPENAI_CODEX_CLIENT_ID.to_string()),
             ("code", code),
             ("code_verifier", verifier),
-            ("redirect_uri", OPENAI_CODEX_REDIRECT_URI),
-        ])
-        .send()
-        .map_err(|error| error.to_string())?;
+            ("redirect_uri", OPENAI_CODEX_REDIRECT_URI.to_string()),
+        ];
+        let response = client
+            .post(OPENAI_CODEX_TOKEN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&params)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("Token exchange failed ({status}): {body}"));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Token exchange failed ({status}): {body}"));
+        }
 
-    let payload: TokenResponse = response.json().map_err(|error| error.to_string())?;
-    let access = payload
-        .access_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token response was missing access_token.".to_string())?;
-    let refresh = payload
-        .refresh_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token response was missing refresh_token.".to_string())?;
-    let expires_in = payload
-        .expires_in
-        .ok_or_else(|| "Token response was missing expires_in.".to_string())?;
-    let account_id = openai_codex_account_id(&access)
-        .ok_or_else(|| "Failed to extract accountId from token.".to_string())?;
-    let mut extra = BTreeMap::new();
-    extra.insert("account_id".to_string(), Value::String(account_id));
-    Ok(OAuthCredentials {
-        access,
-        refresh,
-        expires: current_epoch_ms() + expires_in.saturating_mul(1000),
-        extra,
+        let payload: TokenResponse = response.json().await.map_err(|error| error.to_string())?;
+        let access = payload
+            .access_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token response was missing access_token.".to_string())?;
+        let refresh = payload
+            .refresh_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token response was missing refresh_token.".to_string())?;
+        let expires_in = payload
+            .expires_in
+            .ok_or_else(|| "Token response was missing expires_in.".to_string())?;
+        let account_id = openai_codex_account_id(&access)
+            .ok_or_else(|| "Failed to extract accountId from token.".to_string())?;
+        let mut extra = BTreeMap::new();
+        extra.insert("account_id".to_string(), Value::String(account_id));
+        Ok(OAuthCredentials {
+            access,
+            refresh,
+            expires: current_epoch_ms() + expires_in.saturating_mul(1000),
+            extra,
+        })
     })
 }
 
 fn refresh_openai_codex_token(credentials: &OAuthCredentials) -> Result<OAuthCredentials, String> {
-    let response = blocking_client()?
-        .post(OPENAI_CODEX_TOKEN_URL)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", credentials.refresh.as_str()),
-            ("client_id", OPENAI_CODEX_CLIENT_ID),
-        ])
-        .send()
-        .map_err(|error| error.to_string())?;
+    let client = http_client()?;
+    let refresh_token = credentials.refresh.clone();
+    run_async_http(async move {
+        let params = [
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token),
+            ("client_id", OPENAI_CODEX_CLIENT_ID.to_string()),
+        ];
+        let response = client
+            .post(OPENAI_CODEX_TOKEN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&params)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!(
-            "OpenAI Codex token refresh failed ({status}): {body}"
-        ));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "OpenAI Codex token refresh failed ({status}): {body}"
+            ));
+        }
 
-    let payload: TokenResponse = response.json().map_err(|error| error.to_string())?;
-    let access = payload
-        .access_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token refresh response was missing access_token.".to_string())?;
-    let refresh = payload
-        .refresh_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token refresh response was missing refresh_token.".to_string())?;
-    let expires_in = payload
-        .expires_in
-        .ok_or_else(|| "Token refresh response was missing expires_in.".to_string())?;
-    let account_id = openai_codex_account_id(&access)
-        .ok_or_else(|| "Failed to extract accountId from token.".to_string())?;
-    let mut extra = BTreeMap::new();
-    extra.insert("account_id".to_string(), Value::String(account_id));
-    Ok(OAuthCredentials {
-        access,
-        refresh,
-        expires: current_epoch_ms() + expires_in.saturating_mul(1000),
-        extra,
+        let payload: TokenResponse = response.json().await.map_err(|error| error.to_string())?;
+        let access = payload
+            .access_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token refresh response was missing access_token.".to_string())?;
+        let refresh = payload
+            .refresh_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token refresh response was missing refresh_token.".to_string())?;
+        let expires_in = payload
+            .expires_in
+            .ok_or_else(|| "Token refresh response was missing expires_in.".to_string())?;
+        let account_id = openai_codex_account_id(&access)
+            .ok_or_else(|| "Failed to extract accountId from token.".to_string())?;
+        let mut extra = BTreeMap::new();
+        extra.insert("account_id".to_string(), Value::String(account_id));
+        Ok(OAuthCredentials {
+            access,
+            refresh,
+            expires: current_epoch_ms() + expires_in.saturating_mul(1000),
+            extra,
+        })
     })
 }
 
@@ -781,84 +818,96 @@ fn exchange_anthropic_code(
     verifier: &str,
 ) -> Result<OAuthCredentials, String> {
     let client_id = anthropic_client_id()?;
-    let response = blocking_client()?
-        .post(ANTHROPIC_TOKEN_URL)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "code": code,
-            "state": state,
-            "redirect_uri": ANTHROPIC_REDIRECT_URI,
-            "code_verifier": verifier,
-        }))
-        .send()
-        .map_err(|error| error.to_string())?;
+    let client = http_client()?;
+    let code = code.to_string();
+    let state = state.to_string();
+    let verifier = verifier.to_string();
+    run_async_http(async move {
+        let response = client
+            .post(ANTHROPIC_TOKEN_URL)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "code": code,
+                "state": state,
+                "redirect_uri": ANTHROPIC_REDIRECT_URI,
+                "code_verifier": verifier,
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!(
-            "Anthropic token exchange failed ({status}): {body}"
-        ));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Anthropic token exchange failed ({status}): {body}"
+            ));
+        }
 
-    let payload: TokenResponse = response.json().map_err(|error| error.to_string())?;
-    let access = payload
-        .access_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token response was missing access_token.".to_string())?;
-    let refresh = payload
-        .refresh_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token response was missing refresh_token.".to_string())?;
-    let expires_in = payload
-        .expires_in
-        .ok_or_else(|| "Token response was missing expires_in.".to_string())?;
-    Ok(OAuthCredentials {
-        access,
-        refresh,
-        expires: current_epoch_ms() + expires_in.saturating_mul(1000) - 5 * 60 * 1000,
-        extra: BTreeMap::new(),
+        let payload: TokenResponse = response.json().await.map_err(|error| error.to_string())?;
+        let access = payload
+            .access_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token response was missing access_token.".to_string())?;
+        let refresh = payload
+            .refresh_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token response was missing refresh_token.".to_string())?;
+        let expires_in = payload
+            .expires_in
+            .ok_or_else(|| "Token response was missing expires_in.".to_string())?;
+        Ok(OAuthCredentials {
+            access,
+            refresh,
+            expires: current_epoch_ms() + expires_in.saturating_mul(1000) - 5 * 60 * 1000,
+            extra: BTreeMap::new(),
+        })
     })
 }
 
 fn refresh_anthropic_token(credentials: &OAuthCredentials) -> Result<OAuthCredentials, String> {
     let client_id = anthropic_client_id()?;
-    let response = blocking_client()?
-        .post(ANTHROPIC_TOKEN_URL)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "client_id": client_id,
-            "refresh_token": credentials.refresh,
-        }))
-        .send()
-        .map_err(|error| error.to_string())?;
+    let client = http_client()?;
+    let refresh_token = credentials.refresh.clone();
+    run_async_http(async move {
+        let response = client
+            .post(ANTHROPIC_TOKEN_URL)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": refresh_token,
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("Anthropic token refresh failed ({status}): {body}"));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Anthropic token refresh failed ({status}): {body}"));
+        }
 
-    let payload: TokenResponse = response.json().map_err(|error| error.to_string())?;
-    let access = payload
-        .access_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token refresh response was missing access_token.".to_string())?;
-    let refresh = payload
-        .refresh_token
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Token refresh response was missing refresh_token.".to_string())?;
-    let expires_in = payload
-        .expires_in
-        .ok_or_else(|| "Token refresh response was missing expires_in.".to_string())?;
-    Ok(OAuthCredentials {
-        access,
-        refresh,
-        expires: current_epoch_ms() + expires_in.saturating_mul(1000) - 5 * 60 * 1000,
-        extra: BTreeMap::new(),
+        let payload: TokenResponse = response.json().await.map_err(|error| error.to_string())?;
+        let access = payload
+            .access_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token refresh response was missing access_token.".to_string())?;
+        let refresh = payload
+            .refresh_token
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Token refresh response was missing refresh_token.".to_string())?;
+        let expires_in = payload
+            .expires_in
+            .ok_or_else(|| "Token refresh response was missing expires_in.".to_string())?;
+        Ok(OAuthCredentials {
+            access,
+            refresh,
+            expires: current_epoch_ms() + expires_in.saturating_mul(1000) - 5 * 60 * 1000,
+            extra: BTreeMap::new(),
+        })
     })
 }
 
@@ -1080,6 +1129,7 @@ mod tests {
         AuthCredential, AuthSource, AuthStorage, AuthStorageData, OAuthCredentials, OAuthProvider,
         clear_config_value_cache, get_env_api_key, normalized_expires_ms, openai_codex_account_id,
         parse_authorization_input, register_oauth_provider, resolve_config_value, resolve_headers,
+        run_async_http,
     };
 
     struct StaticOAuthProvider;
@@ -1308,5 +1358,15 @@ mod tests {
             .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
         let token = format!("{header}.{payload}.signature");
         assert_eq!(openai_codex_account_id(&token).as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn async_http_bridge_runs_safely_inside_tokio_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async { run_async_http(async { Ok::<_, String>(7) }) });
+        assert_eq!(result.expect("result"), 7);
     }
 }

@@ -1,5 +1,11 @@
+use std::sync::{Arc, Mutex};
+
 use pi_rust_config::SettingsManager;
 use pi_rust_packages::{PackageInstallScope, PackageManager};
+use pi_rust_plugin_host::{
+    ActivePluginRegistry, LoadedPluginRuntime, PluginHost, PluginHostConfig, PluginHostWarning,
+    PluginStartupSummary,
+};
 use pi_rust_resources::{
     ContextDocument, DiscoveredResources, LoadedTextResource, ParsedResources, PromptTemplate,
     ResourceDiagnostic, ResourceDiscoveryOptions, ResourceScope, ScopedPath, SkillDefinition,
@@ -26,12 +32,14 @@ pub(crate) struct SessionRuntimeConfig {
     pub no_themes: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SessionRuntimeResources {
     pub system_prompt: String,
     pub prompt_templates: Vec<PromptTemplate>,
     pub skills: Vec<SkillDefinition>,
     pub themes: Vec<LoadedTextResource>,
+    pub plugin_runtime: Option<Arc<Mutex<ActivePluginRegistry>>>,
+    pub plugin_startup_summary: PluginStartupSummary,
     pub startup_summary: StartupResourceSummary,
 }
 
@@ -107,8 +115,27 @@ pub(crate) fn load_session_runtime_resources_with_settings(
             .map(|document| document.content)
     });
 
-    let startup_summary =
+    let mut startup_summary =
         build_startup_resource_summary(&discovered, &parsed, &context_files, &context_diagnostics);
+    let plugin_runtime = load_runtime_plugin_registry(&package_manager, &config.cwd);
+    let plugin_startup_summary = plugin_runtime.summary.clone();
+    startup_summary.extensions = plugin_startup_summary
+        .summaries
+        .iter()
+        .map(|summary| summary.descriptor_path.clone())
+        .collect();
+    startup_summary.extension_summaries = plugin_startup_summary
+        .summaries
+        .iter()
+        .map(format_startup_plugin_summary)
+        .collect();
+    startup_summary.notices.extend(
+        plugin_startup_summary
+            .warnings
+            .iter()
+            .cloned()
+            .map(plugin_warning_to_notice),
+    );
 
     SessionRuntimeResources {
         system_prompt: build_system_prompt(BuildSystemPromptOptions {
@@ -122,6 +149,10 @@ pub(crate) fn load_session_runtime_resources_with_settings(
         prompt_templates: parsed.prompts,
         skills: parsed.skills,
         themes: parsed.themes,
+        plugin_runtime: plugin_runtime
+            .registry
+            .map(|registry| Arc::new(Mutex::new(registry))),
+        plugin_startup_summary,
         startup_summary,
     }
 }
@@ -176,6 +207,7 @@ fn build_startup_resource_summary(
             .map(|resource| resource.path.clone())
             .collect(),
         extensions: Vec::new(),
+        extension_summaries: Vec::new(),
         themes: discovered
             .themes
             .iter()
@@ -210,5 +242,82 @@ fn classify_resource_notice_section(
         StartupResourceNoticeSection::Theme
     } else {
         StartupResourceNoticeSection::Resource
+    }
+}
+
+fn load_runtime_plugin_registry(
+    package_manager: &PackageManager,
+    cwd: &std::path::Path,
+) -> LoadedPluginRuntime {
+    let discovery_roots = package_manager
+        .resource_roots()
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
+    if discovery_roots.is_empty() {
+        return LoadedPluginRuntime {
+            registry: None,
+            summary: PluginStartupSummary::default(),
+        };
+    }
+
+    PluginHost::new(PluginHostConfig {
+        discovery_roots,
+        workspace_root: Some(cwd.to_path_buf()),
+        ..PluginHostConfig::default()
+    })
+    .discover_and_load_runtime_plugins()
+}
+
+fn format_startup_plugin_summary(summary: &pi_rust_plugin_host::RegisteredPluginSummary) -> String {
+    let capability_parts = [
+        pluralize_summary_count(summary.commands.len(), "command"),
+        pluralize_summary_count(summary.tools.len(), "tool"),
+        pluralize_summary_count(summary.flags.len(), "flag"),
+        pluralize_summary_count(summary.hooks.len(), "hook"),
+        pluralize_summary_count(summary.providers.len(), "provider"),
+        pluralize_summary_count(summary.models.len(), "model"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let capability_text = if capability_parts.is_empty() {
+        "no registered capabilities".to_string()
+    } else {
+        capability_parts.join(", ")
+    };
+
+    format!(
+        "{} [{}] v{} - {} - {}",
+        summary.plugin_name,
+        summary.plugin_id,
+        summary.manifest_version,
+        capability_text,
+        summary.descriptor_path.to_string_lossy()
+    )
+}
+
+fn pluralize_summary_count(count: usize, label: &'static str) -> Option<String> {
+    if count == 0 {
+        None
+    } else if count == 1 {
+        Some(format!("1 {label}"))
+    } else {
+        Some(format!("{count} {label}s"))
+    }
+}
+
+fn plugin_warning_to_notice(warning: PluginHostWarning) -> StartupResourceNotice {
+    let label = match (warning.plugin_name.as_deref(), warning.plugin_id.as_deref()) {
+        (Some(name), Some(plugin_id)) => format!("{name} [{plugin_id}]"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(plugin_id)) => plugin_id.to_string(),
+        (None, None) => warning.path.to_string_lossy().to_string(),
+    };
+
+    StartupResourceNotice {
+        section: StartupResourceNoticeSection::Extension,
+        path: warning.path,
+        message: format!("{label}: {}", warning.message),
     }
 }

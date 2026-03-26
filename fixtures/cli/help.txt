@@ -4,12 +4,17 @@ Usage:
   pi-rust [options] [@files...] [messages...]
 
 Commands:
-  pi-rust install <source> [-l]    Install extension source and add to settings
-  pi-rust remove <source> [-l]     Remove extension source from settings
-  pi-rust update [source]          Update installed extensions (skips pinned sources)
-  pi-rust list                     List installed extensions from settings
+  pi-rust install <source> [-l]    Install package source and add to settings
+  pi-rust remove <source> [-l]     Remove package source from settings
+  pi-rust update [source]          Update installed packages (skips pinned sources)
+  pi-rust list                     List installed packages from settings
+  pi-rust plugins list             List plugin runtime diagnostics
+  pi-rust plugins add-root <path> [-l|--project]
+                                   Add a plugin root to settings
+  pi-rust plugins remove-root <path> [-l|--project]
+                                   Remove a plugin root from settings
   pi-rust config                   Open TUI to enable/disable package resources
-  pi-rust <command> --help         Show help for install/remove/update/list
+  pi-rust <command> --help         Show help for install/remove/update/list/plugins
 
 Options:
   --provider <name>              Provider name (optional; inferred from model/auth)
@@ -30,8 +35,8 @@ Options:
   --tools <tools>                Comma-separated list of tools to enable (default: read,bash,edit,write)
                                  Available: read, bash, edit, write, grep, find, ls
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
-  --extension, -e <path>         Load an extension file (can be used multiple times)
-  --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
+  --extension, -e <path>         Load a plugin file (can be used multiple times)
+  --no-extensions, -ne           Disable plugin discovery (explicit -e paths still work)
   --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
@@ -40,11 +45,12 @@ Options:
   --no-themes                    Disable theme discovery and loading
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
+  --list-known-models [search]   List all known models with auth source (diagnostic)
   --verbose                      Force verbose startup (overrides quietStartup setting)
   --help, -h                     Show this help
   --version, -v                  Show version number
 
-Extensions can register additional flags (e.g., --plan from plan-mode extension).
+Plugins can register additional flags (e.g., --plan from plan-mode plugin).
 
 Examples:
   # Interactive mode

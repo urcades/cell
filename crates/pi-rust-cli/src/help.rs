@@ -1,4 +1,4 @@
-use super::PackageCommand;
+use super::{PackageCommand, PluginsCommand};
 
 pub fn render_help_text() -> &'static str {
     include_str!("../../../fixtures/cli/help.txt")
@@ -32,4 +32,30 @@ pub fn render_package_command_help(command: PackageCommand) -> &'static str {
             "Usage:\n  pi-rust list\n\nList installed packages from user and project settings.\n"
         }
     }
+}
+
+pub fn render_plugins_command_usage(command: PluginsCommand) -> &'static str {
+    match command {
+        PluginsCommand::List => "pi-rust plugins list",
+        PluginsCommand::AddRoot => "pi-rust plugins add-root <path> [-l|--project]",
+        PluginsCommand::RemoveRoot => "pi-rust plugins remove-root <path> [-l|--project]",
+    }
+}
+
+pub fn render_plugins_command_help(command: PluginsCommand) -> &'static str {
+    match command {
+        PluginsCommand::List => {
+            "Usage:\n  pi-rust plugins list\n\nList plugin runtime diagnostics from discovered plugins.\nUse --mode json for machine-readable diagnostics.\n"
+        }
+        PluginsCommand::AddRoot => {
+            "Usage:\n  pi-rust plugins add-root <path> [-l|--project]\n\nAdd a plugin root to settings.\nUse -l, --project, or --local to store the root in project settings (.pi/settings.json).\n"
+        }
+        PluginsCommand::RemoveRoot => {
+            "Usage:\n  pi-rust plugins remove-root <path> [-l|--project]\n\nRemove a plugin root from settings.\nUse -l, --project, or --local to target project settings (.pi/settings.json).\n"
+        }
+    }
+}
+
+pub fn render_plugins_help_text() -> &'static str {
+    "Usage:\n  pi-rust plugins list\n  pi-rust plugins add-root <path> [-l|--project]\n  pi-rust plugins remove-root <path> [-l|--project]\n\nManage plugin discovery roots and inspect plugin runtime diagnostics.\n"
 }

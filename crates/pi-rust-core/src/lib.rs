@@ -5,13 +5,17 @@ mod runtime_resources;
 mod system_prompt;
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
-use pi_rust_ai_core::{
-    AssistantContentBlock, Message, Model, StopReason, UserContent, UserContentBlock, UserMessage,
-};
+use pi_rust_ai_core::{AssistantContentBlock, Model, StopReason};
 use pi_rust_ai_providers::{ProviderRegistry, ProviderRegistryError};
 use pi_rust_config::{SettingsManager, SettingsManagerError};
-use pi_rust_models::{ModelRegistry, ScopedModel, default_model_for_provider, resolve_cli_model};
+use pi_rust_models::{
+    ModelRegistry, ScopedModel, default_model_for_provider, resolve_cli_model,
+    resolve_known_cli_model,
+};
+use pi_rust_oauth::AuthSource;
 use pi_rust_protocol::OutputMode;
 use pi_rust_session::{SessionManager, SessionManagerError};
 use pi_rust_tools::ToolSet;
@@ -80,6 +84,12 @@ pub enum RuntimeError {
     Export(#[from] export_html::ExportError),
 }
 
+#[cfg(test)]
+pub(crate) fn test_env_guard() -> &'static Mutex<()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| Mutex::new(()))
+}
+
 pub async fn run_non_interactive(
     request: NonInteractiveRequest,
     provider_registry: &ProviderRegistry,
@@ -117,9 +127,7 @@ pub async fn run_non_interactive(
 
     let mut last_assistant_message = None;
     for prompt in pending_messages {
-        let run = agent_session
-            .prompt_message(user_text_message(prompt))
-            .await?;
+        let run = agent_session.prompt_text_as_blocks(prompt).await?;
         if request.mode == OutputMode::Json {
             for event in run.events {
                 output
@@ -154,7 +162,7 @@ pub fn create_agent_session(
             ));
         }
 
-        let provider = resolve_cli_model(
+        let provider = resolve_known_cli_model(
             request.provider.as_deref(),
             request.model.as_deref(),
             model_registry,
@@ -187,13 +195,20 @@ pub fn create_agent_session(
         session_is_empty,
     )?;
     let enabled_tool_names = resolve_enabled_tools(request);
-    let tool_set = ToolSet::with_enabled_names(&request.cwd, &enabled_tool_names);
+    let mut tool_set = ToolSet::with_enabled_names_and_plugins(
+        &request.cwd,
+        &enabled_tool_names,
+        request.tools.is_none() && !request.no_tools,
+    );
     let runtime_config = runtime_config_from_request(request);
     let resources = load_session_runtime_resources_with_settings(
         &runtime_config,
         settings_manager.clone(),
         &enabled_tool_names,
     );
+    if let Some(plugin_runtime) = &resources.plugin_runtime {
+        tool_set.attach_plugin_runtime(plugin_runtime.clone());
+    }
     let thinking_level = request
         .thinking
         .clone()
@@ -230,6 +245,8 @@ pub fn create_agent_session(
         runtime_config,
         enabled_tool_names,
         resources.themes,
+        resources.plugin_runtime,
+        resources.plugin_startup_summary,
         resources.startup_summary,
     );
     Ok(agent_session)
@@ -255,7 +272,7 @@ pub fn export_session_file_to_html(
 
 pub fn list_models(model_registry: &ModelRegistry, search: Option<&str>) -> String {
     let search = search.map(|value| value.to_lowercase());
-    let mut models = model_registry.get_all();
+    let mut models = model_registry.get_available();
     models.sort_by(|left, right| {
         format!("{}/{}", left.provider.0, left.id)
             .cmp(&format!("{}/{}", right.provider.0, right.id))
@@ -269,20 +286,49 @@ pub fn list_models(model_registry: &ModelRegistry, search: Option<&str>) -> Stri
                 provider_id.contains(search) || model.name.to_lowercase().contains(search)
             })
         })
-        .map(|model| {
+        .map(|model| format!("{}/{}", model.provider.0, model.id))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn list_known_models(model_registry: &ModelRegistry, search: Option<&str>) -> String {
+    let search = search.map(|value| value.to_lowercase());
+    let mut models = model_registry.known_models_with_auth();
+    models.sort_by(|left, right| {
+        format!("{}/{}", left.model.provider.0, left.model.id)
+            .cmp(&format!("{}/{}", right.model.provider.0, right.model.id))
+    });
+
+    models
+        .into_iter()
+        .filter(|status| {
+            search.as_ref().is_none_or(|search| {
+                let provider_id =
+                    format!("{}/{}", status.model.provider.0, status.model.id).to_lowercase();
+                provider_id.contains(search) || status.model.name.to_lowercase().contains(search)
+            })
+        })
+        .map(|status| {
             format!(
-                "{}/{}{}",
-                model.provider.0,
-                model.id,
-                if model_registry.get_api_key(&model).is_some() {
-                    " [auth]"
-                } else {
-                    ""
-                }
+                "{}/{} [{}]",
+                status.model.provider.0,
+                status.model.id,
+                auth_source_marker(&status.auth_source)
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn auth_source_marker(source: &AuthSource) -> &'static str {
+    match source {
+        AuthSource::RuntimeOverride => "runtime",
+        AuthSource::StoredApiKey => "stored-api-key",
+        AuthSource::StoredOAuth => "stored-oauth",
+        AuthSource::Environment => "env",
+        AuthSource::Fallback => "fallback",
+        AuthSource::Missing => "missing",
+    }
 }
 
 fn render_text_mode_response(
@@ -313,16 +359,6 @@ fn render_text_mode_response(
         .collect::<Vec<_>>()
         .join("\n");
     output.stdout.push(text);
-}
-
-fn user_text_message(text: String) -> Message {
-    Message::User(UserMessage {
-        content: UserContent::Blocks(vec![UserContentBlock::Text {
-            text,
-            text_signature: None,
-        }]),
-        timestamp: 0,
-    })
 }
 
 fn resolve_enabled_tools(request: &NonInteractiveRequest) -> Vec<String> {
@@ -385,7 +421,11 @@ fn resolve_execution_model(
             settings_manager.get_default_provider(),
             settings_manager.get_default_model(),
         ) {
-            if let Some(model) = model_registry.find(&provider, &model_id) {
+            if let Some(model) = model_registry
+                .get_available()
+                .into_iter()
+                .find(|model| model.provider.0 == provider && model.id == model_id)
+            {
                 return Ok(model);
             }
         }
@@ -417,7 +457,7 @@ fn resolve_execution_model(
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::Arc;
 
     use pi_rust_ai_core::{
         ApiId, AssistantContentBlock, AssistantMessage, AssistantMessageEvent, Context, ModelCost,
@@ -432,8 +472,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        NonInteractiveRequest, create_agent_session, export_session_file_to_html, list_models,
-        run_non_interactive,
+        NonInteractiveRequest, create_agent_session, export_session_file_to_html,
+        list_known_models, list_models, run_non_interactive,
     };
 
     struct EchoProvider;
@@ -562,11 +602,6 @@ mod tests {
         auth.set_runtime_api_key("openai", "runtime-key");
         let models = ModelRegistry::new(auth, None);
         (providers, models)
-    }
-
-    fn env_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     fn session_file_request(cwd: &Path) -> NonInteractiveRequest {
@@ -706,10 +741,20 @@ mod tests {
     }
 
     #[test]
-    fn lists_models_with_auth_annotation() {
+    fn lists_available_models_only() {
         let (_providers, models) = registry_with_provider();
         let output = list_models(&models, Some("openai"));
-        assert!(output.contains("openai/gpt-5.1-codex [auth]"));
+        assert!(output.contains("openai/gpt-5.1-codex"));
+        assert!(!output.contains("openai-codex/gpt-5.3-codex"));
+        assert!(!output.contains("["));
+    }
+
+    #[test]
+    fn lists_known_models_with_auth_markers() {
+        let (_providers, models) = registry_with_provider();
+        let output = list_known_models(&models, Some("openai"));
+        assert!(output.contains("openai/gpt-5.1-codex [runtime]"));
+        assert!(output.contains("openai-codex/gpt-5.3-codex [missing]"));
     }
 
     #[test]
@@ -740,7 +785,7 @@ mod tests {
 
     #[test]
     fn create_agent_session_uses_saved_default_model_when_cli_model_is_omitted() {
-        let _guard = env_guard().lock().expect("env guard");
+        let _guard = crate::test_env_guard().lock().expect("env guard");
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("workspace");
         let agent_dir = tempdir.path().join("agent");
@@ -802,7 +847,7 @@ mod tests {
 
     #[test]
     fn create_agent_session_uses_saved_enabled_models_for_initial_scope() {
-        let _guard = env_guard().lock().expect("env guard");
+        let _guard = crate::test_env_guard().lock().expect("env guard");
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("workspace");
         let agent_dir = tempdir.path().join("agent");

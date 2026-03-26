@@ -84,7 +84,11 @@ const EXTRA_SCENARIOS = [
 	"builtins-results",
 	"copy-empty",
 	"share-missing-gh",
+	"share-success",
+	"share-cancel",
 	"footer-variants",
+	"footer-subscription",
+	"footer-unknown-context",
 	"excluded-bash",
 	"hidden-thinking",
 	"live-streaming-start",
@@ -109,6 +113,8 @@ const SESSION_SCENARIOS = new Set([
 	"logout-populated",
 	"builtins-results",
 	"footer-variants",
+	"footer-subscription",
+	"footer-unknown-context",
 	"custom-messages",
 	"skill-messages",
 	"tool-lifecycle",
@@ -170,6 +176,15 @@ function scenarioRuntimeReadyText(runtime, scenario) {
 		case "ts:config-browser":
 		case "rust:config-browser":
 			return ["Resource Configuration", "Type to filter resources"];
+		case "ts:footer-variants":
+		case "rust:footer-variants":
+			return ["Paritied Session", "gpt-4.1"];
+		case "ts:footer-subscription":
+		case "rust:footer-subscription":
+			return ["Paritied Session", "gpt-5.3-codex"];
+		case "ts:footer-unknown-context":
+		case "rust:footer-unknown-context":
+			return ["Paritied Session", "?/0"];
 		case "ts:live-streaming-start":
 		case "rust:live-streaming-start":
 			return ["Live streaming start", "Waiting for model response..."];
@@ -193,6 +208,19 @@ function scenarioRuntimeReadyText(runtime, scenario) {
 function scenarioLauncherArgs(scenario, sessionPath, extraArgs) {
 	if (scenario === "config-browser") {
 		return ["config"];
+	}
+	if (scenario === "footer-subscription" || scenario === "footer-unknown-context") {
+		return [
+			...(sessionPath ? ["--session", sessionPath] : ["--no-session"]),
+			"--provider",
+			"openai-codex",
+			"--model",
+			"gpt-5.3-codex",
+			"--no-tools",
+			"--thinking",
+			"off",
+			...(extraArgs || []),
+		];
 	}
 
 	const thinkingArgs =
@@ -236,23 +264,68 @@ function scenarioPromptText(scenario) {
 }
 
 function writeModelsFixture(homeDir, baseUrl) {
+	writeModelsJsonFixture(homeDir, {
+		providers: {
+			openai: {
+				baseUrl,
+			},
+		},
+	});
+}
+
+function writeModelsJsonFixture(homeDir, config) {
 	const agentDir = join(homeDir, ".pi", "agent");
 	ensureDir(agentDir);
-	writeFileSync(
-		join(agentDir, "models.json"),
-		JSON.stringify(
-			{
-				providers: {
-					openai: {
-						baseUrl,
+	writeFileSync(join(agentDir, "models.json"), JSON.stringify(config, null, 2), "utf8");
+}
+
+function writeUnknownContextModelsFixture(homeDir) {
+	writeModelsJsonFixture(homeDir, {
+		providers: {
+			"openai-codex": {
+				modelOverrides: {
+					"gpt-5.3-codex": {
+						contextWindow: 0,
 					},
 				},
 			},
-			null,
-			2,
-		),
-		"utf8",
-	);
+		},
+	});
+}
+
+function writeGhFixture(tempRoot, mode) {
+	const binDir = join(tempRoot, "bin");
+	ensureDir(binDir);
+	const ghPath = join(binDir, "gh");
+	const script =
+		mode === "success"
+			? `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "auth" && "$2" == "status" ]]; then
+  exit 0
+fi
+if [[ "$1" == "gist" && "$2" == "create" ]]; then
+  printf '%s\n' 'https://gist.github.com/pi-rust/fake-share-id'
+  exit 0
+fi
+echo "unexpected gh invocation" >&2
+exit 1
+`
+			: `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "auth" && "$2" == "status" ]]; then
+  exit 0
+fi
+if [[ "$1" == "gist" && "$2" == "create" ]]; then
+  sleep 30
+  exit 0
+fi
+echo "unexpected gh invocation" >&2
+exit 1
+`;
+	writeFileSync(ghPath, script, "utf8");
+	chmodSync(ghPath, 0o755);
+	return binDir;
 }
 
 function writeSettingsFixture(homeDir, patch) {
@@ -1117,6 +1190,8 @@ function prepareScenarioFixtures(tempRoot, scenario, cwd, liveBaseUrl) {
 	const fixtures = {
 		sessionPath: undefined,
 		extraArgs: [],
+		extraEnv: {},
+		extraPathEntries: [],
 	};
 
 	if (scenario === "startup-diagnostics" || scenario === "reload-diagnostics") {
@@ -1135,8 +1210,38 @@ function prepareScenarioFixtures(tempRoot, scenario, cwd, liveBaseUrl) {
 		writeAuthFixtures(homeDir);
 	}
 
+	if (scenario === "footer-subscription") {
+		writeAuthFixtures(homeDir);
+	}
+
 	if (liveBaseUrl) {
 		writeModelsFixture(homeDir, liveBaseUrl);
+	}
+
+	if (scenario === "footer-unknown-context") {
+		writeUnknownContextModelsFixture(homeDir);
+	}
+
+	if (scenario === "config-browser") {
+		const packageRoot = join(tempRoot, "local-package");
+		ensureDir(packageRoot);
+		ensureDir(join(packageRoot, "skills"));
+		writeFileSync(
+			join(packageRoot, "skills", "resource.md"),
+			"---\ndescription: Local package skill\n---\nUse the local package resource.\n",
+			"utf8",
+		);
+		writeSettingsFixture(homeDir, { packages: [packageRoot] });
+	}
+
+	if (scenario === "share-success") {
+		fixtures.extraPathEntries.push(writeGhFixture(tempRoot, "success"));
+		fixtures.extraEnv.PI_SHARE_VIEWER_URL = "https://share.example/viewer";
+	}
+
+	if (scenario === "share-cancel") {
+		fixtures.extraPathEntries.push(writeGhFixture(tempRoot, "cancel"));
+		fixtures.extraEnv.PI_SHARE_VIEWER_URL = "https://share.example/viewer";
 	}
 
 	if (scenario === "hidden-thinking") {
@@ -1336,6 +1441,15 @@ function makeLauncher(runtime, options, runtimeRoot, tempRoot) {
 		`export PI_RUST_CODING_AGENT_DIR=${shQuote(join(homeDir, ".pi", "agent"))}`,
 		"export OPENAI_API_KEY='fake-openai-key'",
 	];
+	if (options.extraEnv) {
+		for (const [key, value] of Object.entries(options.extraEnv)) {
+			envLines.push(`export ${key}=${shQuote(value)}`);
+		}
+	}
+	if (options.extraPathEntries && options.extraPathEntries.length > 0) {
+		const pathEntries = [...options.extraPathEntries, process.env.PATH || ""].filter(Boolean);
+		envLines.push(`export PATH=${shQuote(pathEntries.join(":"))}`);
+	}
 	for (const name of API_ENV_VARS) {
 		if (name === "OPENAI_API_KEY") {
 			continue;
@@ -1554,7 +1668,13 @@ function readyForScenario(runtime, scenario, text) {
 			);
 		case "ts:footer-variants":
 		case "rust:footer-variants":
-			return text.includes("Paritied Session") && text.includes("gpt-4.1");
+			return text.includes("gpt-4.1");
+		case "ts:footer-subscription":
+		case "rust:footer-subscription":
+			return text.includes("gpt-5.3-codex");
+		case "ts:footer-unknown-context":
+		case "rust:footer-unknown-context":
+			return text.includes("?/0");
 		case "ts:excluded-bash":
 		case "rust:excluded-bash":
 			return text.includes("Excluded from context") || text.includes("hello-from-bash");
@@ -1869,6 +1989,11 @@ const STATUS_LINE_PREFIXES = [
 	"GitHub CLI is not logged in.",
 	"GitHub CLI (gh) is not installed.",
 	"No agent messages to copy yet.",
+	"Share URL:",
+	"Share cancelled",
+	"Creating gist...",
+	"Failed to create gist",
+	"Updated ",
 	"Reloaded extensions, skills, prompts, themes",
 	"Session Info added to the transcript.",
 	"Changelog added to the transcript.",
@@ -2072,7 +2197,14 @@ async function runScenario(runtime, scenario, options, branch) {
 			: undefined);
 	const launcherPath = makeLauncher(
 		runtime,
-		{ ...options, scenario, sessionPath, extraArgs: preparedFixtures.extraArgs },
+		{
+			...options,
+			scenario,
+			sessionPath,
+			extraArgs: preparedFixtures.extraArgs,
+			extraEnv: preparedFixtures.extraEnv,
+			extraPathEntries: preparedFixtures.extraPathEntries,
+		},
 		runtimeRoot,
 		tempRoot,
 	);
@@ -2090,17 +2222,74 @@ async function runScenario(runtime, scenario, options, branch) {
 		sendLiteral(session, launcherPath);
 		sendKey(session, "Enter");
 		await waitForCapture(session, (text) =>
-			scenario === "startup-resume"
+			scenario === "startup-resume" ||
+			scenario === "config-browser" ||
+			scenario === "footer-variants" ||
+			scenario === "footer-subscription" ||
+			scenario === "footer-unknown-context"
 				? readyForScenario(runtime, scenario, text)
-				: scenario === "config-browser"
-					? readyForScenario(runtime, scenario, text)
-					: bootstrapReady(runtime, text),
+				: bootstrapReady(runtime, text),
 		);
 
 		if (scenario === "config-browser") {
-			await waitForCapture(session, (text) =>
-				readyForScenario(runtime, scenario, text),
+			sendLiteral(session, "local-package");
+			await waitForCapture(
+				session,
+				(text) => text.includes("local-package") && text.includes("[x] resource"),
 			);
+			const initialCapture = captureScenarioSnapshot(
+				session,
+				runtime,
+				scenario,
+				runtimeRoot,
+				tempRoot,
+				branch,
+				{
+					phase: "initial",
+				},
+			);
+			sendKey(session, "Space");
+			await waitForCapture(session, (text) => text.includes("[ ] resource"));
+			const activeCapture = captureScenarioSnapshot(
+				session,
+				runtime,
+				scenario,
+				runtimeRoot,
+				tempRoot,
+				branch,
+				{
+					phase: "active",
+				},
+			);
+			sendKey(session, "Escape");
+			await delay(200);
+			sendLiteral(session, launcherPath);
+			sendKey(session, "Enter");
+			await waitForCapture(session, (text) => readyForScenario(runtime, scenario, text));
+			sendLiteral(session, "local-package");
+			await waitForCapture(
+				session,
+				(text) => text.includes("local-package") && text.includes("[ ] resource"),
+			);
+			const settledCapture = captureScenarioSnapshot(
+				session,
+				runtime,
+				scenario,
+				runtimeRoot,
+				tempRoot,
+				branch,
+				{
+					phase: "settled",
+				},
+			);
+			return {
+				...settledCapture,
+				frames: {
+					initial: initialCapture,
+					active: activeCapture,
+					settled: settledCapture,
+				},
+			};
 		} else if (scenario === "slash") {
 			sendLiteral(session, "/");
 		} else if (scenario === "model") {
@@ -2142,7 +2331,14 @@ async function runScenario(runtime, scenario, options, branch) {
 		} else if (scenario === "scoped-models") {
 			sendLiteral(session, "/scoped-models");
 			sendKey(session, "Enter");
-		} else if (scenario === "startup-diagnostics" || scenario === "footer-variants" || scenario === "custom-messages-and-skills" || scenario === "compaction-and-retry") {
+		} else if (
+			scenario === "startup-diagnostics" ||
+			scenario === "footer-variants" ||
+			scenario === "footer-subscription" ||
+			scenario === "footer-unknown-context" ||
+			scenario === "custom-messages-and-skills" ||
+			scenario === "compaction-and-retry"
+		) {
 			// No extra input; these scenarios are captured from the seeded session/startup surface.
 		} else if (scenario === "resume-populated-management") {
 			sendLiteral(session, "/resume");
@@ -2203,6 +2399,16 @@ async function runScenario(runtime, scenario, options, branch) {
 		} else if (scenario === "share-missing-gh") {
 			sendLiteral(session, "/share");
 			sendKey(session, "Enter");
+		} else if (scenario === "share-success") {
+			sendLiteral(session, "/share");
+			sendKey(session, "Enter");
+			await waitForCapture(session, (text) => text.includes("Share URL:"));
+		} else if (scenario === "share-cancel") {
+			sendLiteral(session, "/share");
+			sendKey(session, "Enter");
+			await waitForCapture(session, (text) => text.includes("Creating gist..."));
+			sendKey(session, "Escape");
+			await waitForCapture(session, (text) => text.includes("Share cancelled"));
 		} else if (scenario === "excluded-bash") {
 			sendLiteral(session, "!!printf hello-from-bash");
 			sendKey(session, "Enter");
